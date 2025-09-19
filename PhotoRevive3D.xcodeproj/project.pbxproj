@@ -8,11 +8,13 @@
 
 /* Begin PBXBuildFile section */
 		E12CA74C2E7D7349006FBB3F /* gitignore in Resources */ = {isa = PBXBuildFile; fileRef = E12CA74B2E7D7344006FBB3F /* gitignore */; };
+		E12CA7552E7D853E006FBB3F /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = E12CA7542E7D853E006FBB3F /* README.md */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		E12CA7262E7D704C006FBB3F /* PhotoRevive3D.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PhotoRevive3D.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		E12CA74B2E7D7344006FBB3F /* gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = gitignore; sourceTree = "<group>"; };
+		E12CA7542E7D853E006FBB3F /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -38,6 +40,7 @@
 			isa = PBXGroup;
 			children = (
 				E12CA74B2E7D7344006FBB3F /* gitignore */,
+				E12CA7542E7D853E006FBB3F /* README.md */,
 				E12CA7282E7D704C006FBB3F /* PhotoRevive3D */,
 				E12CA7272E7D704C006FBB3F /* Products */,
 			);
@@ -115,6 +118,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				E12CA7552E7D853E006FBB3F /* README.md in Resources */,
 				E12CA74C2E7D7349006FBB3F /* gitignore in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
