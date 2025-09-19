@@ -350,7 +350,6 @@ struct ContentView: View {
     private func updateLODFrom(size: CGSize) {
         guard size.width > 0, size.height > 0, let eng = engine else { return }
         let longestPx = max(size.width, size.height) * displayScale
-        // Only rebuild if the target moved meaningfully to avoid thrash.
         let target = max(256, (longestPx / 64).rounded() * 64)
         if abs(target - eng.previewTargetLongest) > 96 {
             eng.updatePreviewLOD(targetLongestPx: target)
@@ -377,34 +376,33 @@ struct ContentView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             // Local CIContext used only on this background thread.
             let context = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
-            var frameCount = 0
+            var frames = 0
 
             while true {
-                // Pull latest params + engine on main; clear pending (coalesce)
-                var eng: ParallaxEngine?
+                // Pull latest params + snapshot on main (fast), clear pending (coalesce).
+                var snap: ParallaxEngine.PreviewSnapshot?
                 var next: (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)?
                 DispatchQueue.main.sync {
-                    eng = self.engine
+                    snap = self.engine?.makePreviewSnapshot()
                     next = self.pendingParams
                     self.pendingParams = nil
                 }
-                guard let engine = eng, let params = next else { break }
+                guard let snapshot = snap, let params = next else { break }
 
-                // Build CIImage on main (keeps engine access safe).
-                var ciImage: CIImage?
-                DispatchQueue.main.sync {
-                    ciImage = engine.renderPreviewCI(yaw: params.yaw, pitch: params.pitch, intensity: params.intensity)
-                }
-                guard let ci = ciImage else { continue }
+                // Compose off-main.
+                let ci = ParallaxEngine.composePreview(from: snapshot,
+                                                       yaw: params.yaw,
+                                                       pitch: params.pitch,
+                                                       intensity: params.intensity)
 
-                // Convert to CGImage/UIImage off-main (heavy bit), tightly scoped for ARC.
+                // Convert CI → CG → UIImage off-main (tight autorelease scope).
                 let image: UIImage? = autoreleasepool {
                     guard let cg = context.createCGImage(ci, from: ci.extent) else { return nil }
                     return UIImage(cgImage: cg)
                 }
 
-                frameCount += 1
-                if (frameCount % 30) == 0 { context.clearCaches() }
+                frames += 1
+                if (frames % 30) == 0 { context.clearCaches() }
 
                 DispatchQueue.main.async {
                     self.previewImage = image

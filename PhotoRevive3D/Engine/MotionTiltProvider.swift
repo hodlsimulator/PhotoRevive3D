@@ -4,9 +4,6 @@
 //  Created by . . on 19/09/2025.
 //
 
-//  MotionTiltProvider.swift
-//  PhotoRevive3D
-
 import Foundation
 @preconcurrency import CoreMotion
 import Combine
@@ -20,6 +17,7 @@ final class MotionTiltProvider: ObservableObject {
         let q = OperationQueue()
         q.name = "com.hodlsimulator.PhotoRevive3D.motion"
         q.qualityOfService = .userInteractive
+        q.maxConcurrentOperationCount = 1
         return q
     }()
 
@@ -51,27 +49,26 @@ final class MotionTiltProvider: ObservableObject {
             }
             guard let m = motion else { return }
 
-            // Map small angles to [-1, 1] with clamping
+            // Compute off-main
             let maxAngle = Double.pi / 6.0 // ±30°
             let yawNorm = max(-1, min(1, m.attitude.yaw / maxAngle))
             let pitchNorm = max(-1, min(1, m.attitude.pitch / maxAngle))
 
-            // Hop to the main actor before touching the observable object.
+            // Hop to the main actor BEFORE touching `self` (actor isolation).
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.yaw = yawNorm
                 self.pitch = pitchNorm
-            }
 
-            // Log only the first sample so we don’t spam the file.
-            if let self, !self.didLogFirstSample {
-                self.didLogFirstSample = true
-                Diagnostics.log(
-                    .info,
-                    String(format: "First sample: yaw=%.3f pitch=%.3f (raw yaw=%.3f pitch=%.3f)",
-                           yawNorm, pitchNorm, m.attitude.yaw, m.attitude.pitch),
-                    category: "gyro"
-                )
+                if !self.didLogFirstSample {
+                    self.didLogFirstSample = true
+                    Diagnostics.log(
+                        .info,
+                        String(format: "First sample: yaw=%.3f pitch=%.3f (raw yaw=%.3f pitch=%.3f)",
+                               yawNorm, pitchNorm, m.attitude.yaw, m.attitude.pitch),
+                        category: "gyro"
+                    )
+                }
             }
         }
 

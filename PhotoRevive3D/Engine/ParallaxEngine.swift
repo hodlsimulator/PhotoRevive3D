@@ -11,13 +11,13 @@ import CoreImage.CIFilterBuiltins
 import UIKit
 
 /// Renders a 2-layer parallax (background vs subject) using the depth/mask.
-/// Full-res for export; **screen-scaled** pipeline for live preview.
+/// Full-res for export; screen-scaled pipeline for live preview.
 final class ParallaxEngine {
     private(set) var originalCI: CIImage
     private(set) var depthCI: CIImage!
     private(set) var personMaskCI: CIImage?
 
-    /// CIContext for both preview + export. We keep caches off for lower transient memory in preview.
+    /// CIContext for both preview + export (keep caches low to avoid spikes).
     private let ciContext = CIContext(options: [
         .useSoftwareRenderer: false,
         .cacheIntermediates: false
@@ -33,14 +33,11 @@ final class ParallaxEngine {
     private var maskCI: CIImage!
 
     // Screen-scaled preview pipeline
-    private(set) var previewTargetLongest: CGFloat = 1600 // in pixels; updated at runtime to match screen
+    private(set) var previewTargetLongest: CGFloat = 1600 // pixels; updated by updatePreviewLOD
     private var previewScale: CGFloat = 1
     private var previewSize: CGSize = .zero
     private var pBgCI: CIImage!
     private var pFgCI: CIImage!
-
-    // Cache management
-    private var previewRenderCount = 0
 
     init(image uiImage: UIImage) {
         if let cg = uiImage.cgImage {
@@ -62,7 +59,7 @@ final class ParallaxEngine {
         self.depthCI = depthRes.depthCI
         self.personMaskCI = depthRes.personMaskCI
 
-        // If no person mask, derive a soft mask from the nearest depth
+        // If no person mask, derive a soft mask from nearest depth
         let subjectMask: CIImage = personMaskCI ?? depthThreshold(depthCI, threshold: 0.6)
 
         // Slightly expand mask to soften edges
@@ -91,53 +88,61 @@ final class ParallaxEngine {
             kCIInputMaskImageKey: invMask
         ])
 
-        // Seed preview layers at the current target (will be refined by updatePreviewLOD)
         rebuildPreviewLayers(targetLongestPx: previewTargetLongest)
     }
 
-    /// Update preview LOD to match on-screen pixel size (Photos-style). Cheap to call;
-    /// it only rebuilds if the scale meaningfully changes.
+    /// Update preview LOD to match on-screen pixel size (Photos-style).
     @MainActor
     func updatePreviewLOD(targetLongestPx: CGFloat) {
-        // Quantise to avoid thrashing on tiny size changes.
         let quantised = max(256, (targetLongestPx / 64).rounded() * 64)
-        previewTargetLongest = quantised
-        rebuildPreviewLayers(targetLongestPx: quantised)
+        if abs(quantised - previewTargetLongest) > 32 {
+            previewTargetLongest = quantised
+            rebuildPreviewLayers(targetLongestPx: quantised)
+        }
     }
 
-    // MARK: - Preview rendering (screen-scaled, off-main friendly)
+    // MARK: - Preview snapshot (thread-safe to *use* off-main)
 
-    /// Returns a downscaled composite suitable for on-screen preview.
-    /// Call this on main or off-main; the returned CIImage is immutable.
-    func renderPreviewCI(yaw: CGFloat, pitch: CGFloat, intensity: CGFloat) -> CIImage {
-        let maxShift = min(previewSize.width, previewSize.height) * 0.02 * intensity // ≈2% of min dimension
+    struct PreviewSnapshot: @unchecked Sendable {
+        let bg: CIImage
+        let fg: CIImage
+        let size: CGSize
+    }
+
+    /// Capture immutable inputs for one preview composition.
+    @MainActor
+    func makePreviewSnapshot() -> PreviewSnapshot? {
+        guard let pBgCI, let pFgCI else { return nil }
+        return PreviewSnapshot(bg: pBgCI, fg: pFgCI, size: previewSize)
+    }
+
+    /// Pure function: compose a preview CIImage from a snapshot + params (off-main friendly).
+    /// Explicitly nonisolated so it can be called from background queues.
+    nonisolated static func composePreview(from snap: PreviewSnapshot,
+                                           yaw: CGFloat,
+                                           pitch: CGFloat,
+                                           intensity: CGFloat) -> CIImage {
+        let maxShift = min(snap.size.width, snap.size.height) * 0.02 * intensity // ≈2% of min dimension
         let bgTx = yaw * maxShift
         let bgTy = pitch * maxShift
         let fgTx = -yaw * maxShift * 0.65
         let fgTy = -pitch * maxShift * 0.65
 
-        let bg = pBgCI
+        let bg = snap.bg
             .transformed(by: .init(translationX: bgTx, y: bgTy))
             .transformed(by: .init(scaleX: 1.01, y: 1.01))
-            .cropped(to: pBgCI.extent)
+            .cropped(to: snap.bg.extent)
 
-        let fg = pFgCI
+        let fg = snap.fg
             .transformed(by: .init(translationX: fgTx, y: fgTy))
             .transformed(by: .init(scaleX: 1.005, y: 1.005))
-            .cropped(to: pFgCI.extent)
+            .cropped(to: snap.fg.extent)
 
-        let ci = fg.applyingFilter("CISourceOverCompositing", parameters: [kCIInputBackgroundImageKey: bg])
-
-        // Periodically purge caches to keep transient memory low during motion.
-        previewRenderCount &+= 1
-        if (previewRenderCount % 30) == 0 { ciContext.clearCaches() }
-
-        return ci
+        return fg.applyingFilter("CISourceOverCompositing", parameters: [kCIInputBackgroundImageKey: bg])
     }
 
     // MARK: - Full-resolution rendering (export)
 
-    /// CIImage render variant used by VideoExporter; stays full-res.
     func renderCI(yaw: CGFloat, pitch: CGFloat, intensity: CGFloat) -> CIImage {
         let maxShift = min(outputSize.width, outputSize.height) * 0.02 * intensity
         let bgTx = yaw * maxShift
@@ -165,7 +170,6 @@ final class ParallaxEngine {
         let longEdge = max(outputSize.width, outputSize.height)
         let newScale = min(1, targetLongestPx / longEdge)
 
-        // Only rebuild if the scale changed meaningfully.
         if abs(newScale - previewScale) < 0.04, pBgCI != nil, pFgCI != nil {
             return
         }
@@ -176,7 +180,6 @@ final class ParallaxEngine {
             let pMask = lanczosScale(maskCI, scale: previewScale)
             let pTransparent = CIImage(color: .clear).cropped(to: pOriginal.extent)
 
-            // Preview foreground/background (mirrors full-res logic in preview pixel space)
             pFgCI = pOriginal.applyingFilter("CIBlendWithMask", parameters: [
                 kCIInputBackgroundImageKey: pTransparent,
                 kCIInputMaskImageKey: pMask
@@ -195,7 +198,7 @@ final class ParallaxEngine {
 
             previewSize = pOriginal.extent.size
         } else {
-            // No downscale needed
+            // No downscale
             previewSize = outputSize
             pBgCI = bgCI
             pFgCI = fgCI
