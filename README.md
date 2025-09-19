@@ -12,7 +12,7 @@ PhotoRevive 3D is an iOS 26-only SwiftUI app that turns any still image into a t
 
 - iOS: 26.0+
 - Xcode: 26 (with the iOS 26 SDK)
-- Swift: 5.x
+- Swift: 6.x
 - Frameworks: SwiftUI, PhotosUI, Vision, Core Image, Core Motion, AVFoundation, UniformTypeIdentifiers
 
 This repository is a plain .xcodeproj with a shared scheme. Open and run — no package setup.
