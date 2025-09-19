@@ -4,6 +4,9 @@
 //  Created by . . on 19/09/2025.
 //
 
+//  MotionTiltProvider.swift
+//  PhotoRevive3D
+
 import Foundation
 @preconcurrency import CoreMotion
 import Combine
@@ -38,8 +41,8 @@ final class MotionTiltProvider: ObservableObject {
             return
         }
 
-        // Lower rate to reduce UI churn / memory pressure during preview.
-        mgr.deviceMotionUpdateInterval = 1.0 / 30.0
+        // Lower rate to reduce churn during preview.
+        mgr.deviceMotionUpdateInterval = 1.0 / 15.0
         didLogFirstSample = false
 
         mgr.startDeviceMotionUpdates(using: .xArbitraryCorrectedZVertical, to: queue) { [weak self] motion, error in
@@ -60,11 +63,11 @@ final class MotionTiltProvider: ObservableObject {
                 self.pitch = pitchNorm
             }
 
-            // Log only the first sample so we don't spam the file.
+            // Log only the first sample so we don’t spam the file.
             if let self, !self.didLogFirstSample {
                 self.didLogFirstSample = true
                 Diagnostics.log(
-                    .debug,
+                    .info,
                     String(format: "First sample: yaw=%.3f pitch=%.3f (raw yaw=%.3f pitch=%.3f)",
                            yawNorm, pitchNorm, m.attitude.yaw, m.attitude.pitch),
                     category: "gyro"
@@ -73,7 +76,7 @@ final class MotionTiltProvider: ObservableObject {
         }
 
         isActive = true
-        Diagnostics.log(.info, "Device motion updates STARTED (.xArbitraryCorrectedZVertical @ 30Hz)", category: "gyro")
+        Diagnostics.log(.info, "Device motion updates STARTED (.xArbitraryCorrectedZVertical @ 15Hz)", category: "gyro")
     }
 
     func stop() {

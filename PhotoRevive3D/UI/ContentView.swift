@@ -5,14 +5,15 @@
 //  Created by . . on 19/09/2025.
 //
 
-//  ContentView.swift
-//  PhotoRevive3D
-
 import SwiftUI
 import PhotosUI
 import CoreMotion
+import CoreImage
+import UIKit
 
 struct ContentView: View {
+    @Environment(\.displayScale) private var displayScale
+
     @State private var pickerItem: PhotosPickerItem?
     @State private var engine: ParallaxEngine?
 
@@ -34,6 +35,11 @@ struct ContentView: View {
     @State private var exportTask: Task<Void, Never>?
     @State private var shareSheet: ShareSheet?
 
+    // Coalesced preview rendering (off-main)
+    @State private var previewImage: UIImage?
+    @State private var renderInFlight = false
+    @State private var pendingParams: (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)?
+
     @StateObject private var motion = MotionTiltProvider()
 
     var body: some View {
@@ -42,17 +48,10 @@ struct ContentView: View {
                 headerBar
 
                 Group {
-                    if let engine {
-                        ParallaxPreview(
-                            engine: engine,
-                            yaw: useMotion ? CGFloat(motion.yaw) : yaw,
-                            pitch: useMotion ? CGFloat(motion.pitch) : pitch,
-                            intensity: intensity
-                        )
-                        .aspectRatio(engine.outputAspect, contentMode: .fit)
-                        .glassCard()
-                        .animation(.easeInOut(duration: 0.15), value: yaw)
-                        .animation(.easeInOut(duration: 0.15), value: pitch)
+                    if let eng = engine {
+                        previewCard
+                            .aspectRatio(eng.outputAspect, contentMode: .fit)
+                            .glassCard()
                     } else {
                         placeholderCard
                     }
@@ -68,18 +67,30 @@ struct ContentView: View {
             .padding(.bottom, 24)
         }
         .sheet(item: $shareSheet) { sheet in sheet }
+
+        // Image picker
         .onChange(of: pickerItem) { _, newItem in
             Task { await loadImage(item: newItem) }
         }
+
+        // Gyro toggle
         .onChange(of: useMotion) { _, enabled in
             if enabled {
                 Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
                 motion.start()
+                schedulePreview()
             } else {
                 Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
                 motion.stop()
             }
         }
+
+        // Live updates — coalesced
+        .onChange(of: motion.yaw) { _, _ in if useMotion { schedulePreview() } }
+        .onChange(of: motion.pitch) { _, _ in if useMotion { schedulePreview() } }
+        .onChange(of: intensity) { _, _ in schedulePreview() }
+        .onChange(of: yaw) { _, _ in if !useMotion { schedulePreview() } }
+        .onChange(of: pitch) { _, _ in if !useMotion { schedulePreview() } }
     }
 
     // MARK: - UI Pieces
@@ -112,6 +123,31 @@ struct ContentView: View {
         .glassCard()
     }
 
+    private var previewCard: some View {
+        ZStack {
+            if let image = previewImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity, minHeight: 200)
+            }
+        }
+        // Measure the actual displayed size (in points), convert to pixels with displayScale,
+        // and update the engine’s preview LOD to match the screen.
+        .overlay(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { updateLODFrom(size: geo.size) }
+                    .onChange(of: geo.size) { _, newSize in
+                        updateLODFrom(size: newSize)
+                    }
+            }
+        )
+    }
+
     private var controlsBar: some View {
         VStack(spacing: 12) {
             if engine != nil {
@@ -126,6 +162,7 @@ struct ContentView: View {
                     Button {
                         yaw = 0; pitch = 0
                         Diagnostics.log(.debug, "Manual centre applied", category: "gyro")
+                        schedulePreview()
                     } label: {
                         Label("Centre", systemImage: "scope")
                     }
@@ -261,6 +298,7 @@ struct ContentView: View {
                     self.pitch = 0
                 }
                 Diagnostics.log(.info, "Image loaded; engine prepared (size=\(engine.outputSize.width)x\(engine.outputSize.height))", category: "engine")
+                schedulePreview() // first preview
             }
         } catch {
             Diagnostics.log(.error, "Image load/prepare error: \(error)", category: "engine")
@@ -289,7 +327,6 @@ struct ContentView: View {
                     engine: engine,
                     options: options
                 ) { progress in
-                    // Hop to the main actor for UI state safely.
                     Task { @MainActor in exportProgress = progress }
                 }
                 await MainActor.run {
@@ -306,23 +343,77 @@ struct ContentView: View {
             }
         }
     }
-}
 
-private struct ParallaxPreview: View {
-    let engine: ParallaxEngine
-    let yaw: CGFloat
-    let pitch: CGFloat
-    let intensity: CGFloat
+    // MARK: - Preview LOD + coalesced renderer
 
-    var body: some View {
-        if let image = engine.renderPreviewUIImage(yaw: yaw, pitch: pitch, intensity: intensity) {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFit()
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    /// Update engine preview LOD based on the on-screen size (in points → pixels).
+    private func updateLODFrom(size: CGSize) {
+        guard size.width > 0, size.height > 0, let eng = engine else { return }
+        let longestPx = max(size.width, size.height) * displayScale
+        // Only rebuild if the target moved meaningfully to avoid thrash.
+        let target = max(256, (longestPx / 64).rounded() * 64)
+        if abs(target - eng.previewTargetLongest) > 96 {
+            eng.updatePreviewLOD(targetLongestPx: target)
+            schedulePreview()
+        }
+    }
+
+    private func currentParams() -> (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)? {
+        guard engine != nil else { return nil }
+        if useMotion {
+            return (CGFloat(motion.yaw), CGFloat(motion.pitch), intensity)
         } else {
-            ProgressView()
-                .frame(maxWidth: .infinity, minHeight: 200)
+            return (yaw, pitch, intensity)
+        }
+    }
+
+    private func schedulePreview() {
+        guard let params = currentParams() else { return }
+        pendingParams = params
+        guard !renderInFlight else { return }
+
+        renderInFlight = true
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Local CIContext used only on this background thread.
+            let context = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+            var frameCount = 0
+
+            while true {
+                // Pull latest params + engine on main; clear pending (coalesce)
+                var eng: ParallaxEngine?
+                var next: (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)?
+                DispatchQueue.main.sync {
+                    eng = self.engine
+                    next = self.pendingParams
+                    self.pendingParams = nil
+                }
+                guard let engine = eng, let params = next else { break }
+
+                // Build CIImage on main (keeps engine access safe).
+                var ciImage: CIImage?
+                DispatchQueue.main.sync {
+                    ciImage = engine.renderPreviewCI(yaw: params.yaw, pitch: params.pitch, intensity: params.intensity)
+                }
+                guard let ci = ciImage else { continue }
+
+                // Convert to CGImage/UIImage off-main (heavy bit), tightly scoped for ARC.
+                let image: UIImage? = autoreleasepool {
+                    guard let cg = context.createCGImage(ci, from: ci.extent) else { return nil }
+                    return UIImage(cgImage: cg)
+                }
+
+                frameCount += 1
+                if (frameCount % 30) == 0 { context.clearCaches() }
+
+                DispatchQueue.main.async {
+                    self.previewImage = image
+                }
+            }
+
+            DispatchQueue.main.async {
+                self.renderInFlight = false
+            }
         }
     }
 }

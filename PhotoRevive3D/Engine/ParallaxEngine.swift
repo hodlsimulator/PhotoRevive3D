@@ -11,14 +11,17 @@ import CoreImage.CIFilterBuiltins
 import UIKit
 
 /// Renders a 2-layer parallax (background vs subject) using the depth/mask.
-/// Full-res for export; downscaled pipeline for live preview.
+/// Full-res for export; **screen-scaled** pipeline for live preview.
 final class ParallaxEngine {
     private(set) var originalCI: CIImage
     private(set) var depthCI: CIImage!
     private(set) var personMaskCI: CIImage?
 
-    /// CIContext for both preview + export
-    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    /// CIContext for both preview + export. We keep caches off for lower transient memory in preview.
+    private let ciContext = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .cacheIntermediates: false
+    ])
 
     // Full-resolution output (used by exporter)
     private(set) var outputSize: CGSize
@@ -29,12 +32,15 @@ final class ParallaxEngine {
     private var fgCI: CIImage!
     private var maskCI: CIImage!
 
-    // Downscaled preview pipeline to keep interactive rendering light
-    private let previewLongest: CGFloat = 1600 // longest edge in px for live preview
+    // Screen-scaled preview pipeline
+    private(set) var previewTargetLongest: CGFloat = 1600 // in pixels; updated at runtime to match screen
     private var previewScale: CGFloat = 1
     private var previewSize: CGSize = .zero
     private var pBgCI: CIImage!
     private var pFgCI: CIImage!
+
+    // Cache management
+    private var previewRenderCount = 0
 
     init(image uiImage: UIImage) {
         if let cg = uiImage.cgImage {
@@ -73,7 +79,7 @@ final class ParallaxEngine {
             kCIInputMaskImageKey: maskCI as Any
         ])
 
-        // Background = image over transparent using inverted mask, upscaled a touch to reduce edge gaps
+        // Background = image over transparent using inverted mask, slightly scaled to reduce edge gaps
         let invMask = maskCI.applyingFilter("CIColorInvert")
         let slightlyScaledBG = originalCI
             .transformed(by: .init(scaleX: 1.03, y: 1.03))
@@ -85,49 +91,24 @@ final class ParallaxEngine {
             kCIInputMaskImageKey: invMask
         ])
 
-        // Prepare downscaled preview layers
-        let longEdge = max(outputSize.width, outputSize.height)
-        previewScale = min(1, previewLongest / longEdge)
-        if previewScale < 1 {
-            let pOriginal = lanczosScale(originalCI, scale: previewScale)
-            let pMask = lanczosScale(maskCI, scale: previewScale)
-            let pTransparent = CIImage(color: .clear).cropped(to: pOriginal.extent)
-
-            // Preview foreground/background (mirrors full-res logic in preview pixel space)
-            pFgCI = pOriginal.applyingFilter("CIBlendWithMask", parameters: [
-                kCIInputBackgroundImageKey: pTransparent,
-                kCIInputMaskImageKey: pMask
-            ])
-
-            let pInvMask = pMask.applyingFilter("CIColorInvert")
-            let pSlight = pOriginal
-                .transformed(by: .init(scaleX: 1.03, y: 1.03))
-                .transformed(by: .init(translationX: -pOriginal.extent.width * 0.015,
-                                       y: -pOriginal.extent.height * 0.015))
-                .cropped(to: pOriginal.extent)
-            pBgCI = pSlight.applyingFilter("CIBlendWithMask", parameters: [
-                kCIInputBackgroundImageKey: pTransparent,
-                kCIInputMaskImageKey: pInvMask
-            ])
-
-            previewSize = pOriginal.extent.size
-        } else {
-            // No downscale needed
-            previewScale = 1
-            previewSize = outputSize
-            pBgCI = bgCI
-            pFgCI = fgCI
-        }
+        // Seed preview layers at the current target (will be refined by updatePreviewLOD)
+        rebuildPreviewLayers(targetLongestPx: previewTargetLongest)
     }
 
-    // MARK: - Preview rendering (downscaled)
-
-    func renderPreviewUIImage(yaw: CGFloat, pitch: CGFloat, intensity: CGFloat) -> UIImage? {
-        let ci = renderPreviewCI(yaw: yaw, pitch: pitch, intensity: intensity)
-        guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return nil }
-        return UIImage(cgImage: cg, scale: 1, orientation: .up)
+    /// Update preview LOD to match on-screen pixel size (Photos-style). Cheap to call;
+    /// it only rebuilds if the scale meaningfully changes.
+    @MainActor
+    func updatePreviewLOD(targetLongestPx: CGFloat) {
+        // Quantise to avoid thrashing on tiny size changes.
+        let quantised = max(256, (targetLongestPx / 64).rounded() * 64)
+        previewTargetLongest = quantised
+        rebuildPreviewLayers(targetLongestPx: quantised)
     }
 
+    // MARK: - Preview rendering (screen-scaled, off-main friendly)
+
+    /// Returns a downscaled composite suitable for on-screen preview.
+    /// Call this on main or off-main; the returned CIImage is immutable.
     func renderPreviewCI(yaw: CGFloat, pitch: CGFloat, intensity: CGFloat) -> CIImage {
         let maxShift = min(previewSize.width, previewSize.height) * 0.02 * intensity // ≈2% of min dimension
         let bgTx = yaw * maxShift
@@ -145,7 +126,13 @@ final class ParallaxEngine {
             .transformed(by: .init(scaleX: 1.005, y: 1.005))
             .cropped(to: pFgCI.extent)
 
-        return fg.applyingFilter("CISourceOverCompositing", parameters: [kCIInputBackgroundImageKey: bg])
+        let ci = fg.applyingFilter("CISourceOverCompositing", parameters: [kCIInputBackgroundImageKey: bg])
+
+        // Periodically purge caches to keep transient memory low during motion.
+        previewRenderCount &+= 1
+        if (previewRenderCount % 30) == 0 { ciContext.clearCaches() }
+
+        return ci
     }
 
     // MARK: - Full-resolution rendering (export)
@@ -172,6 +159,48 @@ final class ParallaxEngine {
     }
 
     // MARK: - Helpers
+
+    @MainActor
+    private func rebuildPreviewLayers(targetLongestPx: CGFloat) {
+        let longEdge = max(outputSize.width, outputSize.height)
+        let newScale = min(1, targetLongestPx / longEdge)
+
+        // Only rebuild if the scale changed meaningfully.
+        if abs(newScale - previewScale) < 0.04, pBgCI != nil, pFgCI != nil {
+            return
+        }
+
+        previewScale = newScale
+        if previewScale < 1 {
+            let pOriginal = lanczosScale(originalCI, scale: previewScale)
+            let pMask = lanczosScale(maskCI, scale: previewScale)
+            let pTransparent = CIImage(color: .clear).cropped(to: pOriginal.extent)
+
+            // Preview foreground/background (mirrors full-res logic in preview pixel space)
+            pFgCI = pOriginal.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: pTransparent,
+                kCIInputMaskImageKey: pMask
+            ])
+
+            let pInvMask = pMask.applyingFilter("CIColorInvert")
+            let pSlight = pOriginal
+                .transformed(by: .init(scaleX: 1.03, y: 1.03))
+                .transformed(by: .init(translationX: -pOriginal.extent.width * 0.015,
+                                       y: -pOriginal.extent.height * 0.015))
+                .cropped(to: pOriginal.extent)
+            pBgCI = pSlight.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: pTransparent,
+                kCIInputMaskImageKey: pInvMask
+            ])
+
+            previewSize = pOriginal.extent.size
+        } else {
+            // No downscale needed
+            previewSize = outputSize
+            pBgCI = bgCI
+            pFgCI = fgCI
+        }
+    }
 
     private func depthThreshold(_ depth: CIImage, threshold: CGFloat) -> CIImage {
         // Convert grayscale to alpha via thresholding
