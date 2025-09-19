@@ -8,97 +8,122 @@ import Foundation
 @preconcurrency import CoreMotion
 import Combine
 
-/// Provides normalised tilt from CoreMotion for the preview (±1 over ~±30°).
-/// Not actor-isolated; we hop to the main actor only where needed.
-final class MotionTiltProvider: ObservableObject {
+// MARK: - Background service (no @MainActor)
+
+/// Pure CoreMotion service that delivers callbacks on the main thread.
+/// It computes normalized yaw/pitch in the handler (15 Hz is lightweight).
+final class MotionTiltService {
+
+    static var isAvailable: Bool { CMMotionManager().isDeviceMotionAvailable }
+
     private let mgr = CMMotionManager()
+    private(set) var active = false
 
-    // Background queue for CoreMotion callbacks.
-    private let queue: OperationQueue = {
-        let q = OperationQueue()
-        q.name = "com.hodlsimulator.PhotoRevive3D.motion"
-        q.qualityOfService = .userInteractive
-        q.maxConcurrentOperationCount = 1
-        return q
-    }()
+    // These closures are explicitly main-actor isolated.
+    private var sampleHandler: (@MainActor (Double, Double) -> Void)?
+    private var errorHandler: (@MainActor (Error) -> Void)?
 
-    @Published var yaw: Double = 0      // write on main actor
-    @Published var pitch: Double = 0    // write on main actor
+    deinit {
+        mgr.stopDeviceMotionUpdates()
+    }
 
-    private var didLogFirstSample = false
-    private var isActive = false        // read/write on main actor
+    /// Starts device motion and delivers *main-thread* callbacks.
+    func start(
+        onSample: @escaping @MainActor (Double, Double) -> Void,
+        onError: @escaping @MainActor (Error) -> Void
+    ) {
+        guard !active, mgr.isDeviceMotionAvailable else { return }
 
-    func start() {
-        // Ensure we execute the body on the main actor.
-        if !Thread.isMainThread {
-            Task { @MainActor [weak self] in self?.start() }
-            return
-        }
-
-        Diagnostics.log(.info, "Gyro start requested (available=\(mgr.isDeviceMotionAvailable))", category: "gyro")
-        guard mgr.isDeviceMotionAvailable else {
-            Diagnostics.log(.warn, "Device motion not available on this device/simulator", category: "gyro")
-            return
-        }
-        guard !isActive else {
-            Diagnostics.log(.debug, "Start ignored (already active)", category: "gyro")
-            return
-        }
+        active = true
+        sampleHandler = onSample
+        errorHandler = onError
 
         mgr.deviceMotionUpdateInterval = 1.0 / 15.0
-        didLogFirstSample = false
-        isActive = true
-        Diagnostics.log(.info, "Device motion updates STARTED (.xArbitraryCorrectedZVertical @ 15Hz)", category: "gyro")
 
-        // IMPORTANT: Do NOT capture `self` here; do all `self` work inside the inner main-actor hop.
-        mgr.startDeviceMotionUpdates(using: .xArbitraryCorrectedZVertical, to: queue) { motion, error in
+        // ✅ Run the CoreMotion handler on the MAIN operation queue to satisfy MainActor isolation.
+        mgr.startDeviceMotionUpdates(using: .xArbitraryCorrectedZVertical, to: .main) { [weak self] motion, error in
+            #if DEBUG
+            dispatchPrecondition(condition: .onQueue(.main))
+            #endif
+            guard let self, self.active else { return }
+
             if let error {
-                Diagnostics.log(.error, "DeviceMotion handler error: \(error)", category: "gyro")
+                self.errorHandler?(error)
+                return
             }
             guard let m = motion else { return }
 
-            // Compute off-main.
-            let maxAngle = Double.pi / 6.0  // ±30°
-            let yawNorm = max(-1, min(1, m.attitude.yaw   / maxAngle))
+            // Lightweight normalisation on main (15 Hz).
+            let maxAngle = Double.pi / 6.0 // ±30°
+            let yawNorm   = max(-1, min(1, m.attitude.yaw   / maxAngle))
             let pitchNorm = max(-1, min(1, m.attitude.pitch / maxAngle))
 
-            // Publish on the main actor (closure is @Sendable and main-isolated).
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                guard self.isActive else { return }
-                self.yaw = yawNorm
-                self.pitch = pitchNorm
-
-                if !self.didLogFirstSample {
-                    self.didLogFirstSample = true
-                    let f3: (Double) -> String = { String(format: "%.3f", $0) }
-                    Diagnostics.log(
-                        .info,
-                        "First sample: yaw=\(f3(yawNorm)) pitch=\(f3(pitchNorm)) " +
-                        "(raw yaw=\(f3(m.attitude.yaw)) pitch=\(f3(m.attitude.pitch)))",
-                        category: "gyro"
-                    )
-                }
-            }
+            self.sampleHandler?(yawNorm, pitchNorm)
         }
     }
 
     func stop() {
-        if !Thread.isMainThread {
-            Task { @MainActor [weak self] in self?.stop() }
-            return
-        }
-        guard isActive || mgr.isDeviceMotionActive else {
-            Diagnostics.log(.debug, "Stop ignored (not active)", category: "gyro")
-            return
-        }
+        guard active else { return }
+        active = false
         mgr.stopDeviceMotionUpdates()
-        isActive = false
+        sampleHandler = nil
+        errorHandler = nil
+    }
+}
+
+// MARK: - UI-facing provider (MainActor)
+
+/// SwiftUI-friendly wrapper that holds published tilt values.
+/// All state updates and logging happen on the main actor.
+@MainActor
+final class MotionTiltProvider: ObservableObject {
+
+    @Published var yaw: Double = 0
+    @Published var pitch: Double = 0
+
+    private let service = MotionTiltService()
+    private var didLogFirstSample = false
+
+    /// Start (idempotent from UI).
+    func start() {
+        Diagnostics.log(.info, "Gyro start requested (available=\(MotionTiltService.isAvailable))", category: "gyro")
+
+        guard MotionTiltService.isAvailable else {
+            Diagnostics.log(.warn, "Device motion not available on this device/simulator", category: "gyro")
+            return
+        }
+
+        didLogFirstSample = false
+        Diagnostics.log(.info, "Device motion updates STARTED (.xArbitraryCorrectedZVertical @ 15Hz)", category: "gyro")
+
+        service.start { [weak self] yaw, pitch in
+            guard let self else { return }
+
+            // We are on main here.
+            self.yaw = yaw
+            self.pitch = pitch
+
+            if !self.didLogFirstSample {
+                self.didLogFirstSample = true
+                let f3: (Double) -> String = { String(format: "%.3f", $0) }
+                Diagnostics.log(
+                    .info,
+                    "First sample: yaw=\(f3(yaw)) pitch=\(f3(pitch))",
+                    category: "gyro"
+                )
+            }
+        } onError: { err in
+            // Also on main.
+            Diagnostics.log(.error, "DeviceMotion handler error: \(err)", category: "gyro")
+        }
+    }
+
+    /// Stop (idempotent).
+    func stop() {
+        Diagnostics.log(.info, "Gyro STOP requested", category: "gyro")
+        service.stop()
         Diagnostics.log(.info, "Device motion updates STOPPED", category: "gyro")
     }
 
-    deinit {
-        mgr.stopDeviceMotionUpdates()
-        Diagnostics.log(.debug, "MotionTiltProvider deinit", category: "gyro")
-    }
+    // No deinit needed; service cleans up its CMMotionManager.
 }
