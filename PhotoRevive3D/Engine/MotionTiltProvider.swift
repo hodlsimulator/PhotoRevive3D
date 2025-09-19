@@ -1,31 +1,45 @@
-//
 //  MotionTiltProvider.swift
 //  PhotoRevive3D
 //
-//  Created by . . on 9/19/25.
+//  Created by . . on 19/09/2025.
 //
 
 import Foundation
-import CoreMotion
+@preconcurrency import CoreMotion
 import Combine
 
-/// Very small CoreMotion helper that exposes yaw/pitch in [-1, 1].
+@MainActor
 final class MotionTiltProvider: ObservableObject {
+
     private let mgr = CMMotionManager()
-    private let queue = OperationQueue()
+
+    // Background queue for sensor callbacks.
+    private let queue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "com.hodlsimulator.PhotoRevive3D.motion"
+        q.qualityOfService = .userInteractive
+        return q
+    }()
+
     @Published var yaw: Double = 0
     @Published var pitch: Double = 0
 
     func start() {
         guard mgr.isDeviceMotionAvailable else { return }
         mgr.deviceMotionUpdateInterval = 1.0 / 60.0
+
+        // IMPORTANT: Don’t touch `self` off the main actor.
         mgr.startDeviceMotionUpdates(using: .xArbitraryCorrectedZVertical, to: queue) { [weak self] motion, _ in
-            guard let self, let m = motion else { return }
+            guard let m = motion else { return }
+
             // Map small angles to [-1, 1] with clamping
-            let maxAngle: Double = .pi / 6.0 // ±30°
+            let maxAngle = Double.pi / 6.0 // ±30°
             let yawNorm = max(-1, min(1, m.attitude.yaw / maxAngle))
             let pitchNorm = max(-1, min(1, m.attitude.pitch / maxAngle))
-            DispatchQueue.main.async {
+
+            // Hop to the main actor before touching the observable object.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
                 self.yaw = yawNorm
                 self.pitch = pitchNorm
             }
@@ -36,4 +50,3 @@ final class MotionTiltProvider: ObservableObject {
         mgr.stopDeviceMotionUpdates()
     }
 }
-
