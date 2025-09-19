@@ -33,8 +33,7 @@ struct ContentView: View {
     @State private var preparing = false
     @State private var exporting = false
     @State private var exportProgress: Double = 0.0
-    @State private var exportTask: Task<Void, Error>?
-
+    @State private var exportTask: Task<Void, Never>?
     @State private var shareSheet: ShareSheet?
 
     // Coalesced preview rendering
@@ -76,26 +75,46 @@ struct ContentView: View {
             Task { await loadImage(item: newItem) }
         }
 
-        // Gyro toggle
+        // Gyro toggle — defer to next main-tick to avoid re-entrancy.
         .onChange(of: useMotion) { _, enabled in
-            if enabled {
-                Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
-                Diagnostics.startMemorySampler(tag: "[gyro]")
-                motion.start()
-                schedulePreview()
-            } else {
-                Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
-                Diagnostics.stopMemorySampler()
-                motion.stop()
+            DispatchQueue.main.async {
+                if enabled {
+                    Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
+                    Diagnostics.startMemorySampler(tag: "[gyro]")
+                    motion.start()
+                    // Also defer the first preview kick.
+                    DispatchQueue.main.async { schedulePreview() }
+                } else {
+                    Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
+                    Diagnostics.stopMemorySampler()
+                    motion.stop()
+                }
             }
         }
 
         // Live updates — coalesced
-        .onChange(of: motion.yaw) { _, _ in if useMotion { schedulePreview() } }
-        .onChange(of: motion.pitch) { _, _ in if useMotion { schedulePreview() } }
-        .onChange(of: intensity) { _, _ in schedulePreview() }
-        .onChange(of: yaw) { _, _ in if !useMotion { schedulePreview() } }
-        .onChange(of: pitch) { _, _ in if !useMotion { schedulePreview() } }
+        .onChange(of: motion.yaw) { _, _ in
+            if useMotion { schedulePreview() }
+        }
+        .onChange(of: motion.pitch) { _, _ in
+            if useMotion { schedulePreview() }
+        }
+        .onChange(of: intensity) { _, _ in
+            schedulePreview()
+        }
+        .onChange(of: yaw) { _, _ in
+            if !useMotion { schedulePreview() }
+        }
+        .onChange(of: pitch) { _, _ in
+            if !useMotion { schedulePreview() }
+        }
+        .onDisappear {
+            // Safety: ensure sensors are off when view disappears.
+            if useMotion {
+                Diagnostics.stopMemorySampler()
+                motion.stop()
+            }
+        }
     }
 
     // MARK: - UI Pieces
@@ -156,7 +175,9 @@ struct ContentView: View {
                         Label("Gyro", systemImage: "gyroscope")
                     }
                     .toggleStyle(.switch)
+
                     Spacer()
+
                     Button {
                         yaw = 0; pitch = 0
                         Diagnostics.log(.debug, "Manual centre applied", category: "gyro")
@@ -171,10 +192,13 @@ struct ContentView: View {
                     Text("Parallax Intensity")
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(.secondary)
-                    Slider(value: Binding(
-                        get: { Double(intensity) },
-                        set: { intensity = CGFloat($0) }
-                    ), in: 0.2...1.0)
+                    Slider(
+                        value: Binding(
+                            get: { Double(intensity) },
+                            set: { intensity = CGFloat($0) }
+                        ),
+                        in: 0.2...1.0
+                    )
                 }
 
                 if !useMotion {
@@ -182,20 +206,28 @@ struct ContentView: View {
                         Text("Manual Tilt")
                             .font(.footnote.weight(.semibold))
                             .foregroundStyle(.secondary)
+
                         HStack {
                             Image(systemName: "arrow.left")
-                            Slider(value: Binding(
-                                get: { Double(yaw) },
-                                set: { yaw = CGFloat($0) }
-                            ), in: -1.0...1.0)
+                            Slider(
+                                value: Binding(
+                                    get: { Double(yaw) },
+                                    set: { yaw = CGFloat($0) }
+                                ),
+                                in: -1.0...1.0
+                            )
                             Image(systemName: "arrow.right")
                         }
+
                         HStack {
                             Image(systemName: "arrow.down")
-                            Slider(value: Binding(
-                                get: { Double(pitch) },
-                                set: { pitch = CGFloat($0) }
-                            ), in: -1.0...1.0)
+                            Slider(
+                                value: Binding(
+                                    get: { Double(pitch) },
+                                    set: { pitch = CGFloat($0) }
+                                ),
+                                in: -1.0...1.0
+                            )
                             Image(systemName: "arrow.up")
                         }
                     }
@@ -214,6 +246,7 @@ struct ContentView: View {
                                 .font(.subheadline.weight(.semibold))
                             Spacer()
                         }
+
                         HStack(spacing: 16) {
                             VStack(alignment: .leading) {
                                 let secs = exportSeconds.formatted(.number.precision(.fractionLength(1)))
@@ -235,6 +268,7 @@ struct ContentView: View {
                                 .frame(maxWidth: 200)
                             }
                         }
+
                         VStack(alignment: .leading) {
                             Text("Motion Curve")
                                 .font(.caption)
@@ -259,11 +293,13 @@ struct ContentView: View {
                     if exporting {
                         ProgressView(value: exportProgress)
                             .frame(width: 120)
+
                         Button(role: .destructive) { exportTask?.cancel() } label: {
                             Label("Cancel", systemImage: "xmark.circle")
                         }
                         .buttonStyle(.bordered)
                     }
+
                     Spacer()
                 }
             }
@@ -271,8 +307,7 @@ struct ContentView: View {
             if preparing {
                 HStack(spacing: 8) {
                     ProgressView()
-                    Text("Preparing…")
-                        .foregroundStyle(.secondary)
+                    Text("Preparing…").foregroundStyle(.secondary)
                 }
             }
         }
@@ -293,9 +328,7 @@ struct ContentView: View {
                     self.yaw = 0
                     self.pitch = 0
                 }
-                Diagnostics.log(.info,
-                                "Image loaded; engine prepared (size=\(engine.outputSize.width)x\(engine.outputSize.height))",
-                                category: "engine")
+                Diagnostics.log(.info, "Image loaded; engine prepared (size=\(engine.outputSize.width)x\(engine.outputSize.height))", category: "engine")
                 schedulePreview() // first preview
             }
         } catch {
@@ -317,8 +350,7 @@ struct ContentView: View {
             curve: exportCurve
         )
 
-        Diagnostics.log(.info, "Export started (duration=\(exportSeconds)s, fps=\(exportFPS))",
-                        category: "export")
+        Diagnostics.log(.info, "Export started (duration=\(exportSeconds)s, fps=\(exportFPS))", category: "export")
 
         exportTask = Task(priority: .userInitiated) {
             do {
@@ -368,17 +400,15 @@ struct ContentView: View {
     private func schedulePreview() {
         guard let params = currentParams() else { return }
 
-        // Defer state mutation to the next main runloop tick to avoid
-        // “modifying state during view update” traps.
-        Task { @MainActor in
-            pendingParams = params
-            guard !renderInFlight else { return }
-            renderInFlight = true
+        // Defer state mutation to the next main run-loop tick to avoid traps.
+        DispatchQueue.main.async {
+            self.pendingParams = params
+            guard !self.renderInFlight else { return }
+            self.renderInFlight = true
 
-            previewTask = Task.detached(priority: .userInitiated) {
+            self.previewTask = Task.detached(priority: .userInitiated) {
                 var frames = 0
                 var loggedStart = false
-
                 while true {
                     // Fetch snapshot + coalesced params atomically on the main actor.
                     let fetched = await MainActor.run { () -> (ParallaxEngine.PreviewSnapshot, (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat), CGFloat)? in
@@ -393,25 +423,16 @@ struct ContentView: View {
 
                     if !loggedStart {
                         loggedStart = true
-                        Diagnostics.log(.info,
-                                        "preview.start LOD=\(Int(lodPx))px snap=\(Int(snapshot.size.width))x\(Int(snapshot.size.height))",
-                                        category: "preview")
+                        Diagnostics.log(.info, "preview.start LOD=\(Int(lodPx))px snap=\(Int(snapshot.size.width))x\(Int(snapshot.size.height))", category: "preview")
                         Diagnostics.logMemory("[preview.start]")
                     }
 
                     // Compose off-main (pure function).
-                    let ci = ParallaxEngine.composePreview(from: snapshot,
-                                                           yaw: next.yaw,
-                                                           pitch: next.pitch,
-                                                           intensity: next.intensity)
+                    let ci = ParallaxEngine.composePreview(from: snapshot, yaw: next.yaw, pitch: next.pitch, intensity: next.intensity)
                     frames += 1
-                    if frames % 60 == 0 {
-                        Diagnostics.logMemory("[preview.frames=\(frames)]")
-                    }
+                    if frames % 60 == 0 { Diagnostics.logMemory("[preview.frames=\(frames)]") }
 
-                    await MainActor.run {
-                        self.previewCI = ci
-                    }
+                    await MainActor.run { self.previewCI = ci }
                 }
 
                 await MainActor.run {

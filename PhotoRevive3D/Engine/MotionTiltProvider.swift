@@ -42,29 +42,33 @@ final class MotionTiltProvider: ObservableObject {
         mgr.deviceMotionUpdateInterval = 1.0 / 15.0
         didLogFirstSample = false
 
+        // Start updates to our background queue.
         mgr.startDeviceMotionUpdates(using: .xArbitraryCorrectedZVertical, to: queue) { [weak self] motion, error in
             if let error {
                 Diagnostics.log(.error, "DeviceMotion handler error: \(error)", category: "gyro")
             }
             guard let m = motion else { return }
 
-            // Compute off-main
-            let maxAngle = Double.pi / 6.0 // ±30°
-            let yawNorm = max(-1, min(1, m.attitude.yaw / maxAngle))
+            // Compute off-main.
+            let maxAngle = Double.pi / 6.0  // ±30°
+            let yawNorm = max(-1, min(1, m.attitude.yaw   / maxAngle))
             let pitchNorm = max(-1, min(1, m.attitude.pitch / maxAngle))
 
-            // Hop to the main actor BEFORE touching `self` (actor isolation).
-            Task { @MainActor [weak self] in
+            // Hop to the NEXT run-loop tick on the main thread before publishing.
+            DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
+                guard self.isActive else { return }  // ignore late samples after stop()
+
                 self.yaw = yawNorm
                 self.pitch = pitchNorm
 
                 if !self.didLogFirstSample {
                     self.didLogFirstSample = true
-                    let f3 = FloatingPointFormatStyle<Double>.number.precision(.fractionLength(3))
+                    let f3: (Double) -> String = { String(format: "%.3f", $0) }
                     Diagnostics.log(
                         .info,
-                        "First sample: yaw=\(yawNorm.formatted(f3)) pitch=\(pitchNorm.formatted(f3)) (raw yaw=\(m.attitude.yaw.formatted(f3)) pitch=\(m.attitude.pitch.formatted(f3)))",
+                        "First sample: yaw=\(f3(yawNorm)) pitch=\(f3(pitchNorm)) " +
+                        "(raw yaw=\(f3(m.attitude.yaw)) pitch=\(f3(m.attitude.pitch)))",
                         category: "gyro"
                     )
                 }

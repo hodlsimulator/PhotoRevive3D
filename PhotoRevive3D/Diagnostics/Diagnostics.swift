@@ -20,6 +20,7 @@ enum Diagnostics {
     private static var memTimer: DispatchSourceTimer?
 
     // MARK: - Bootstrap / lifecycle
+
     static func bootstrap() {
         markLaunch()
         MetricsSubscriber.shared.start()
@@ -73,7 +74,7 @@ enum Diagnostics {
     nonisolated static func logMemory(_ label: String = "") {
         let mb = footprintMB()
         if mb >= 0 {
-            let formatted = mb.formatted(.number.precision(.fractionLength(1)))
+            let formatted = String(format: "%.1f", mb)
             log(.info, "footprint=\(formatted) MB \(label)", category: "mem")
         } else {
             log(.warn, "footprint= \(label)", category: "mem")
@@ -88,7 +89,7 @@ enum Diagnostics {
         t.setEventHandler {
             let mb = footprintMB()
             if mb >= 0 {
-                let formatted = mb.formatted(.number.precision(.fractionLength(1)))
+                let formatted = String(format: "%.1f", mb)
                 log(.info, "footprint=\(formatted) MB \(tag)", category: "mem")
             }
         }
@@ -107,8 +108,11 @@ enum Diagnostics {
     /// Returns current process physical footprint in MB (or -1 on failure).
     nonisolated private static func footprintMB() -> Double {
         var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size) / 4
-        let kerr = withUnsafeMutablePointer(to: &info) {
+        // FIX: specify generic types for MemoryLayout
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<integer_t>.stride
+        )
+        let kerr: kern_return_t = withUnsafeMutablePointer(to: &info) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
                 task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
             }
@@ -145,12 +149,11 @@ enum Diagnostics {
         \(summary)
         Last run crashed: \(didCrashLastLaunch ? "YES" : "NO")
         ===================================
-
+        
         --- Recent Log (last 64KB) ---
         """
         var body = header
         body += await tail(64 * 1024)
-
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("Diagnostics-\(Int(Date().timeIntervalSince1970)).txt")
         try body.write(to: url, atomically: true, encoding: .utf8)
@@ -169,25 +172,33 @@ enum Diagnostics {
     static func lastCrashJSON() -> String? {
         let dir = diagnosticsDir()
         let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return nil }
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else {
+            return nil
+        }
         let candidates = files.filter { $0.lastPathComponent.hasPrefix("MX") && $0.pathExtension == "json" }
         guard let latest = candidates.max(by: { (a, b) -> Bool in
             let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return da < db
-        }) else { return nil }
+        }) else {
+            return nil
+        }
         return try? String(contentsOf: latest, encoding: .utf8)
     }
 
     static func lastCrashSummary() -> String? {
         guard let text = lastCrashJSON(),
               let data = text.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
 
         let buckets = ["crashDiagnostics", "cpuExceptionDiagnostics", "hangDiagnostics"]
         var diag: [String: Any]? = nil
         for key in buckets {
-            if let arr = root[key] as? [[String: Any]], let first = arr.first { diag = first; break }
+            if let arr = root[key] as? [[String: Any]], let first = arr.first {
+                diag = first; break
+            }
         }
         guard let diag else { return "No crash diagnostics array found." }
 
@@ -311,8 +322,7 @@ enum Diagnostics {
         Bundle.main.bundleIdentifier ?? "PhotoRevive3D"
     }
 
-    @MainActor
-    static func deviceSummary() -> String {
+    @MainActor static func deviceSummary() -> String {
         let b = Bundle.main
         let v = b.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         let build = b.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
