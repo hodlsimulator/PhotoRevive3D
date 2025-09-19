@@ -6,8 +6,13 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		E12CA74C2E7D7349006FBB3F /* gitignore in Resources */ = {isa = PBXBuildFile; fileRef = E12CA74B2E7D7344006FBB3F /* gitignore */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		E12CA7262E7D704C006FBB3F /* PhotoRevive3D.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PhotoRevive3D.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		E12CA74B2E7D7344006FBB3F /* gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = gitignore; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -32,6 +37,7 @@
 		E12CA71D2E7D704C006FBB3F = {
 			isa = PBXGroup;
 			children = (
+				E12CA74B2E7D7344006FBB3F /* gitignore */,
 				E12CA7282E7D704C006FBB3F /* PhotoRevive3D */,
 				E12CA7272E7D704C006FBB3F /* Products */,
 			);
@@ -109,6 +115,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				E12CA74C2E7D7349006FBB3F /* gitignore in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

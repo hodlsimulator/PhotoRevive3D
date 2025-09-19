@@ -1,0 +1,20 @@
+# Xcode / Swift
+DerivedData/
+build/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.xcuserstate
+
+# SwiftPM
+.swiftpm/
+.build/
+
+# CocoaPods / Carthage (not used yet)
+Pods/
+Carthage/Build/
+
+# User settings
+*.orig
+.DS_Store
+
