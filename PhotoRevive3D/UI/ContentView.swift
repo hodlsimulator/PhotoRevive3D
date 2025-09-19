@@ -5,6 +5,9 @@
 //  Created by . . on 19/09/2025.
 //
 
+//  ContentView.swift
+//  PhotoRevive3D
+
 import SwiftUI
 import PhotosUI
 import CoreMotion
@@ -20,8 +23,8 @@ struct ContentView: View {
     @State private var useMotion = false
 
     // Export options
-    @State private var exportSeconds: Double = 4.0     // 2…8
-    @State private var exportFPS: Int = 30             // 24/30/60
+    @State private var exportSeconds: Double = 4.0 // 2…8
+    @State private var exportFPS: Int = 30         // 24/30/60
     @State private var exportCurve: ExportOptions.MotionCurve = .easeInOut
 
     // State
@@ -29,8 +32,8 @@ struct ContentView: View {
     @State private var exporting = false
     @State private var exportProgress: Double = 0.0
     @State private var exportTask: Task<Void, Never>?
-
     @State private var shareSheet: ShareSheet?
+
     @StateObject private var motion = MotionTiltProvider()
 
     var body: some View {
@@ -69,7 +72,13 @@ struct ContentView: View {
             Task { await loadImage(item: newItem) }
         }
         .onChange(of: useMotion) { _, enabled in
-            if enabled { motion.start() } else { motion.stop() }
+            if enabled {
+                Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
+                motion.start()
+            } else {
+                Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
+                motion.stop()
+            }
         }
     }
 
@@ -116,6 +125,7 @@ struct ContentView: View {
 
                     Button {
                         yaw = 0; pitch = 0
+                        Diagnostics.log(.debug, "Manual centre applied", category: "gyro")
                     } label: {
                         Label("Centre", systemImage: "scope")
                     }
@@ -126,6 +136,7 @@ struct ContentView: View {
                     Text("Parallax Intensity")
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(.secondary)
+
                     Slider(value: Binding(
                         get: { Double(intensity) },
                         set: { intensity = CGFloat($0) }
@@ -170,7 +181,6 @@ struct ContentView: View {
                                 .font(.subheadline.weight(.semibold))
                             Spacer()
                         }
-
                         HStack(spacing: 16) {
                             VStack(alignment: .leading) {
                                 Text("Duration \(String(format: "%.1f", exportSeconds))s")
@@ -178,7 +188,6 @@ struct ContentView: View {
                                     .foregroundStyle(.secondary)
                                 Slider(value: $exportSeconds, in: 2.0...8.0, step: 0.5)
                             }
-
                             VStack(alignment: .leading) {
                                 Text("FPS \(exportFPS)")
                                     .font(.caption)
@@ -192,7 +201,6 @@ struct ContentView: View {
                                 .frame(maxWidth: 200)
                             }
                         }
-
                         VStack(alignment: .leading) {
                             Text("Motion Curve")
                                 .font(.caption)
@@ -209,9 +217,7 @@ struct ContentView: View {
 
                 // Export buttons + progress
                 HStack(spacing: 12) {
-                    Button {
-                        startExport()
-                    } label: {
+                    Button { startExport() } label: {
                         Label("Export Video", systemImage: "square.and.arrow.up")
                     }
                     .buttonStyle(.borderedProminent)
@@ -220,14 +226,11 @@ struct ContentView: View {
                     if exporting {
                         ProgressView(value: exportProgress)
                             .frame(width: 120)
-                        Button(role: .destructive) {
-                            exportTask?.cancel()
-                        } label: {
+                        Button(role: .destructive) { exportTask?.cancel() } label: {
                             Label("Cancel", systemImage: "xmark.circle")
                         }
                         .buttonStyle(.bordered)
                     }
-
                     Spacer()
                 }
             }
@@ -246,9 +249,7 @@ struct ContentView: View {
 
     private func loadImage(item: PhotosPickerItem?) async {
         guard let item else { return }
-
         await MainActor.run { preparing = true }
-
         do {
             if let data = try await item.loadTransferable(type: Data.self),
                let uiImage = UIImage(data: data) {
@@ -259,11 +260,11 @@ struct ContentView: View {
                     self.yaw = 0
                     self.pitch = 0
                 }
+                Diagnostics.log(.info, "Image loaded; engine prepared (size=\(engine.outputSize.width)x\(engine.outputSize.height))", category: "engine")
             }
         } catch {
-            print("Image load/prepare error:", error)
+            Diagnostics.log(.error, "Image load/prepare error: \(error)", category: "engine")
         }
-
         await MainActor.run { preparing = false }
     }
 
@@ -280,6 +281,8 @@ struct ContentView: View {
             curve: exportCurve
         )
 
+        Diagnostics.log(.info, "Export started (duration=\(exportSeconds)s, fps=\(exportFPS))", category: "export")
+
         exportTask = Task(priority: .userInitiated) {
             do {
                 let url = try await VideoExporter.exportParallaxVideo(
@@ -287,19 +290,19 @@ struct ContentView: View {
                     options: options
                 ) { progress in
                     // Hop to the main actor for UI state safely.
-                    Task { @MainActor in
-                        exportProgress = progress
-                    }
+                    Task { @MainActor in exportProgress = progress }
                 }
                 await MainActor.run {
                     exporting = false
                     shareSheet = ShareSheet(items: [url])
                 }
+                Diagnostics.log(.info, "Export finished → \(url.lastPathComponent)", category: "export")
             } catch is CancellationError {
                 await MainActor.run { exporting = false }
+                Diagnostics.log(.warn, "Export cancelled", category: "export")
             } catch {
                 await MainActor.run { exporting = false }
-                print("Export failed:", error)
+                Diagnostics.log(.error, "Export failed: \(error)", category: "export")
             }
         }
     }
@@ -312,7 +315,7 @@ private struct ParallaxPreview: View {
     let intensity: CGFloat
 
     var body: some View {
-        if let image = engine.renderUIImage(yaw: yaw, pitch: pitch, intensity: intensity) {
+        if let image = engine.renderPreviewUIImage(yaw: yaw, pitch: pitch, intensity: intensity) {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFit()

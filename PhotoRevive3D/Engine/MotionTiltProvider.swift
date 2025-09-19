@@ -10,7 +10,6 @@ import Combine
 
 @MainActor
 final class MotionTiltProvider: ObservableObject {
-
     private let mgr = CMMotionManager()
 
     // Background queue for sensor callbacks.
@@ -24,12 +23,29 @@ final class MotionTiltProvider: ObservableObject {
     @Published var yaw: Double = 0
     @Published var pitch: Double = 0
 
-    func start() {
-        guard mgr.isDeviceMotionAvailable else { return }
-        mgr.deviceMotionUpdateInterval = 1.0 / 60.0
+    private var didLogFirstSample = false
+    private var isActive = false
 
-        // IMPORTANT: Don’t touch `self` off the main actor.
-        mgr.startDeviceMotionUpdates(using: .xArbitraryCorrectedZVertical, to: queue) { [weak self] motion, _ in
+    func start() {
+        Diagnostics.log(.info, "Gyro start requested (available=\(mgr.isDeviceMotionAvailable))", category: "gyro")
+
+        guard mgr.isDeviceMotionAvailable else {
+            Diagnostics.log(.warn, "Device motion not available on this device/simulator", category: "gyro")
+            return
+        }
+        guard !isActive else {
+            Diagnostics.log(.debug, "Start ignored (already active)", category: "gyro")
+            return
+        }
+
+        // Lower rate to reduce UI churn / memory pressure during preview.
+        mgr.deviceMotionUpdateInterval = 1.0 / 30.0
+        didLogFirstSample = false
+
+        mgr.startDeviceMotionUpdates(using: .xArbitraryCorrectedZVertical, to: queue) { [weak self] motion, error in
+            if let error {
+                Diagnostics.log(.error, "DeviceMotion handler error: \(error)", category: "gyro")
+            }
             guard let m = motion else { return }
 
             // Map small angles to [-1, 1] with clamping
@@ -43,10 +59,35 @@ final class MotionTiltProvider: ObservableObject {
                 self.yaw = yawNorm
                 self.pitch = pitchNorm
             }
+
+            // Log only the first sample so we don't spam the file.
+            if let self, !self.didLogFirstSample {
+                self.didLogFirstSample = true
+                Diagnostics.log(
+                    .debug,
+                    String(format: "First sample: yaw=%.3f pitch=%.3f (raw yaw=%.3f pitch=%.3f)",
+                           yawNorm, pitchNorm, m.attitude.yaw, m.attitude.pitch),
+                    category: "gyro"
+                )
+            }
         }
+
+        isActive = true
+        Diagnostics.log(.info, "Device motion updates STARTED (.xArbitraryCorrectedZVertical @ 30Hz)", category: "gyro")
     }
 
     func stop() {
+        guard isActive || mgr.isDeviceMotionActive else {
+            Diagnostics.log(.debug, "Stop ignored (not active)", category: "gyro")
+            return
+        }
         mgr.stopDeviceMotionUpdates()
+        isActive = false
+        Diagnostics.log(.info, "Device motion updates STOPPED", category: "gyro")
+    }
+
+    deinit {
+        mgr.stopDeviceMotionUpdates()
+        Diagnostics.log(.debug, "MotionTiltProvider deinit", category: "gyro")
     }
 }

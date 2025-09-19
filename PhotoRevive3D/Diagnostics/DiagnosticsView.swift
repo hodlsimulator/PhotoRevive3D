@@ -6,12 +6,13 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct DiagnosticsView: View {
     @State private var logTail: String = ""
     @State private var summary: String = ""
-    @State private var shareItems: [Any] = []
-    @State private var presentShare = false
+    @State private var confirmClear = false
+    @State private var copied = false
 
     var body: some View {
         NavigationStack {
@@ -36,6 +37,7 @@ struct DiagnosticsView: View {
                     Text("Recent Log (last 64KB)")
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(.secondary)
+
                     ScrollView {
                         Text(logTail.isEmpty ? "No log yet." : logTail)
                             .font(.system(.footnote, design: .monospaced))
@@ -48,29 +50,35 @@ struct DiagnosticsView: View {
 
                 HStack {
                     Button {
-                        Task {
-                            let urls = await Diagnostics.collectShareURLs()
-                            await MainActor.run {
-                                shareItems = urls
-                                presentShare = true
-                            }
-                        }
+                        Task { await copyAll() }
                     } label: {
-                        Label("Share All", systemImage: "square.and.arrow.up")
+                        Label(copied ? "Copied" : "Copy All", systemImage: copied ? "checkmark" : "doc.on.doc")
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(logTail.isEmpty && summary.isEmpty)
 
                     Button {
-                        Task {
-                            let text = await Diagnostics.tail()
-                            await MainActor.run { logTail = text }
-                        }
+                        Task { await refresh() }
                     } label: {
                         Label("Refresh", systemImage: "arrow.clockwise")
                     }
                     .buttonStyle(.bordered)
 
+                    Button(role: .destructive) {
+                        confirmClear = true
+                    } label: {
+                        Label("Clear", systemImage: "trash")
+                    }
+                    .buttonStyle(.bordered)
+
                     Spacer()
+                }
+
+                if copied {
+                    Text("Copied to clipboard.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .transition(.opacity)
                 }
 
                 Spacer(minLength: 8)
@@ -78,16 +86,65 @@ struct DiagnosticsView: View {
             .padding()
             .navigationBarTitleDisplayMode(.inline)
         }
-        .task {
-            let text = await Diagnostics.tail()
-            let s = await MainActor.run { Diagnostics.deviceSummary() }
-            await MainActor.run {
-                logTail = text
-                summary = s
+        .task { await initialLoad() }
+        .alert("Clear diagnostics?", isPresented: $confirmClear) {
+            Button("Clear", role: .destructive) {
+                Task { await clearAndRefresh() }
             }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This deletes the rolling logs, backup, MetricKit payloads, and the crash marker.")
         }
-        .sheet(isPresented: $presentShare) {
-            ShareSheet(items: shareItems)
+    }
+
+    // MARK: - Actions
+
+    private func initialLoad() async {
+        let text = await Diagnostics.tail()
+        let s = await MainActor.run { Diagnostics.deviceSummary() }
+        await MainActor.run {
+            logTail = text
+            summary = s
+        }
+    }
+
+    private func refresh() async {
+        let text = await Diagnostics.tail()
+        await MainActor.run {
+            withAnimation { copied = false }
+            logTail = text
+        }
+    }
+
+    private func clearAndRefresh() async {
+        await Diagnostics.clearAll()
+        let text = await Diagnostics.tail()
+        await MainActor.run {
+            withAnimation { copied = false }
+            logTail = text
+        }
+    }
+
+    private func copyAll() async {
+        // Build a fresh, single text blob and copy it to the clipboard.
+        let text = await Diagnostics.tail()
+        let ts = Diagnostics.timestamp()
+        let s = await MainActor.run { Diagnostics.deviceSummary() }
+
+        var report = """
+        ==== PhotoRevive3D Diagnostics ====
+        Time: \(ts)
+        \(s)
+        Last run crashed: \(Diagnostics.didCrashLastLaunch ? "YES" : "NO")
+        ===================================
+
+        --- Recent Log (last 64KB) ---
+        """
+        report += "\n" + text
+
+        await MainActor.run {
+            UIPasteboard.general.string = report
+            withAnimation { copied = true }
         }
     }
 }

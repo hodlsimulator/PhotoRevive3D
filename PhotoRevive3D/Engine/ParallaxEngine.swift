@@ -11,23 +11,32 @@ import CoreImage.CIFilterBuiltins
 import UIKit
 
 /// Renders a 2-layer parallax (background vs subject) using the depth/mask.
-/// Fully on-device; no external dependencies.
+/// Full-res for export; downscaled pipeline for live preview.
 final class ParallaxEngine {
     private(set) var originalCI: CIImage
     private(set) var depthCI: CIImage!
     private(set) var personMaskCI: CIImage?
+
+    /// CIContext for both preview + export
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
+    // Full-resolution output (used by exporter)
     private(set) var outputSize: CGSize
     var outputAspect: CGFloat { outputSize.width / outputSize.height }
 
-    // Precomputed layers
+    // Precomputed full-res layers
     private var bgCI: CIImage!
     private var fgCI: CIImage!
     private var maskCI: CIImage!
 
+    // Downscaled preview pipeline to keep interactive rendering light
+    private let previewLongest: CGFloat = 1600 // longest edge in px for live preview
+    private var previewScale: CGFloat = 1
+    private var previewSize: CGSize = .zero
+    private var pBgCI: CIImage!
+    private var pFgCI: CIImage!
+
     init(image uiImage: UIImage) {
-        // Normalise to CIImage in sRGB
         if let cg = uiImage.cgImage {
             self.originalCI = CIImage(cgImage: cg)
         } else if let ci = uiImage.ciImage {
@@ -38,7 +47,7 @@ final class ParallaxEngine {
         self.outputSize = originalCI.extent.size
     }
 
-    /// Must be called once after init. Performs segmentation+layer prep.
+    /// Must be called once after init.
     @MainActor
     func prepare() async throws {
         // Build synthetic depth + (optional) person mask
@@ -47,7 +56,7 @@ final class ParallaxEngine {
         self.depthCI = depthRes.depthCI
         self.personMaskCI = depthRes.personMaskCI
 
-        // If no person mask, derive a soft mask from the brightest (nearest) depth
+        // If no person mask, derive a soft mask from the nearest depth
         let subjectMask: CIImage = personMaskCI ?? depthThreshold(depthCI, threshold: 0.6)
 
         // Slightly expand mask to soften edges
@@ -55,7 +64,6 @@ final class ParallaxEngine {
             .clampedToExtent()
             .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 5.0])
             .cropped(to: originalCI.extent)
-
         self.maskCI = clamp01(softMask)
 
         // Foreground = image over transparent using mask
@@ -67,28 +75,84 @@ final class ParallaxEngine {
 
         // Background = image over transparent using inverted mask, upscaled a touch to reduce edge gaps
         let invMask = maskCI.applyingFilter("CIColorInvert")
-        let slightlyScaledBG = originalCI.transformed(by: .init(scaleX: 1.03, y: 1.03))
+        let slightlyScaledBG = originalCI
+            .transformed(by: .init(scaleX: 1.03, y: 1.03))
             .transformed(by: .init(translationX: -originalCI.extent.width * 0.015,
                                    y: -originalCI.extent.height * 0.015))
             .cropped(to: originalCI.extent)
-
         bgCI = slightlyScaledBG.applyingFilter("CIBlendWithMask", parameters: [
             kCIInputBackgroundImageKey: transparent,
             kCIInputMaskImageKey: invMask
         ])
+
+        // Prepare downscaled preview layers
+        let longEdge = max(outputSize.width, outputSize.height)
+        previewScale = min(1, previewLongest / longEdge)
+        if previewScale < 1 {
+            let pOriginal = lanczosScale(originalCI, scale: previewScale)
+            let pMask = lanczosScale(maskCI, scale: previewScale)
+            let pTransparent = CIImage(color: .clear).cropped(to: pOriginal.extent)
+
+            // Preview foreground/background (mirrors full-res logic in preview pixel space)
+            pFgCI = pOriginal.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: pTransparent,
+                kCIInputMaskImageKey: pMask
+            ])
+
+            let pInvMask = pMask.applyingFilter("CIColorInvert")
+            let pSlight = pOriginal
+                .transformed(by: .init(scaleX: 1.03, y: 1.03))
+                .transformed(by: .init(translationX: -pOriginal.extent.width * 0.015,
+                                       y: -pOriginal.extent.height * 0.015))
+                .cropped(to: pOriginal.extent)
+            pBgCI = pSlight.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: pTransparent,
+                kCIInputMaskImageKey: pInvMask
+            ])
+
+            previewSize = pOriginal.extent.size
+        } else {
+            // No downscale needed
+            previewScale = 1
+            previewSize = outputSize
+            pBgCI = bgCI
+            pFgCI = fgCI
+        }
     }
 
-    /// Render a frame image from yaw/pitch in [-1,1] and intensity in [0.2,1.0].
-    func renderUIImage(yaw: CGFloat, pitch: CGFloat, intensity: CGFloat) -> UIImage? {
-        let ci = renderCI(yaw: yaw, pitch: pitch, intensity: intensity)
+    // MARK: - Preview rendering (downscaled)
+
+    func renderPreviewUIImage(yaw: CGFloat, pitch: CGFloat, intensity: CGFloat) -> UIImage? {
+        let ci = renderPreviewCI(yaw: yaw, pitch: pitch, intensity: intensity)
         guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return nil }
         return UIImage(cgImage: cg, scale: 1, orientation: .up)
     }
 
-    /// CIImage render variant (used by VideoExporter)
+    func renderPreviewCI(yaw: CGFloat, pitch: CGFloat, intensity: CGFloat) -> CIImage {
+        let maxShift = min(previewSize.width, previewSize.height) * 0.02 * intensity // ≈2% of min dimension
+        let bgTx = yaw * maxShift
+        let bgTy = pitch * maxShift
+        let fgTx = -yaw * maxShift * 0.65
+        let fgTy = -pitch * maxShift * 0.65
+
+        let bg = pBgCI
+            .transformed(by: .init(translationX: bgTx, y: bgTy))
+            .transformed(by: .init(scaleX: 1.01, y: 1.01))
+            .cropped(to: pBgCI.extent)
+
+        let fg = pFgCI
+            .transformed(by: .init(translationX: fgTx, y: fgTy))
+            .transformed(by: .init(scaleX: 1.005, y: 1.005))
+            .cropped(to: pFgCI.extent)
+
+        return fg.applyingFilter("CISourceOverCompositing", parameters: [kCIInputBackgroundImageKey: bg])
+    }
+
+    // MARK: - Full-resolution rendering (export)
+
+    /// CIImage render variant used by VideoExporter; stays full-res.
     func renderCI(yaw: CGFloat, pitch: CGFloat, intensity: CGFloat) -> CIImage {
-        // Translate background and foreground in opposite directions; small scale to reduce edge exposure
-        let maxShift = min(outputSize.width, outputSize.height) * 0.02 * intensity // ≈2% of min dimension
+        let maxShift = min(outputSize.width, outputSize.height) * 0.02 * intensity
         let bgTx = yaw * maxShift
         let bgTy = pitch * maxShift
         let fgTx = -yaw * maxShift * 0.65
@@ -104,7 +168,6 @@ final class ParallaxEngine {
             .transformed(by: .init(scaleX: 1.005, y: 1.005))
             .cropped(to: originalCI.extent)
 
-        // Composite fg over bg
         return fg.applyingFilter("CISourceOverCompositing", parameters: [kCIInputBackgroundImageKey: bg])
     }
 
@@ -131,6 +194,13 @@ final class ParallaxEngine {
         image.applyingFilter("CIColorClamp", parameters: [
             "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
             "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+        ])
+    }
+
+    private func lanczosScale(_ image: CIImage, scale: CGFloat) -> CIImage {
+        image.applyingFilter("CILanczosScaleTransform", parameters: [
+            kCIInputScaleKey: scale,
+            kCIInputAspectRatioKey: 1.0
         ])
     }
 }
