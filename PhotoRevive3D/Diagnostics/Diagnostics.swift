@@ -5,31 +5,28 @@
 //  Created by . . on 19/09/2025.
 //
 
+// Diagnostics.swift
+// PhotoRevive3D
+
 import Foundation
 import os
 import UIKit
-import Darwin // for mach task_info()
+import Darwin // mach task_info(), gmtime_r()
 
 enum Diagnostics {
     enum Level: String { case debug = "DEBUG", info = "INFO", warn = "WARN", error = "ERROR" }
-
-    // Actor that owns the rolling log file.
-    private static let store = LogStore()
-
-    // Memory sampler timer
-    private static var memTimer: DispatchSourceTimer?
 
     // MARK: - Bootstrap / lifecycle
 
     static func bootstrap() {
         markLaunch()
         MetricsSubscriber.shared.start()
-        log(.info, "Diagnostics bootstrap complete")
+        log(.info, "Diagnostics bootstrap complete (sampler=OFF)")
     }
 
     static func markLaunch() {
         let url = markerURL()
-        try? "running".data(using: .utf8)?.write(to: url, options: .atomic)
+        try? "running".data(using: String.Encoding.utf8)?.write(to: url, options: .atomic)
     }
 
     static func markCleanExit() {
@@ -40,9 +37,9 @@ enum Diagnostics {
         FileManager.default.fileExists(atPath: markerURL().path)
     }
 
-    // MARK: - Logging
+    // MARK: - Logging (OSLog + simple rolling file; no actors, no ICU)
 
-    /// `nonisolated` so it can be called from background queues (e.g. MetricKit).
+    /// Safe to call from any thread.
     nonisolated static func log(
         _ level: Level = .info,
         _ message: String,
@@ -59,18 +56,29 @@ enum Diagnostics {
         case .error: logger.error("\(category): \(message, privacy: .public)")
         }
 
-        let ts = timestamp()
+        let ts = timestamp() // ICU-free
         let lineStr = "[\(ts)] [\(level.rawValue)] [\(category)] \(message) (\(file):\(line) \(function))"
-        Task.detached(priority: .utility) { await store.append(lineStr) }
+        appendLine(lineStr)
     }
 
     static func tail(_ maxBytes: Int = 64 * 1024) async -> String {
-        await store.tail(maxBytes)
+        let (fileURL, _) = logURLs()
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return "" }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let off = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+        try? handle.seek(toOffset: off)
+        let data = (try? handle.readToEnd()) ?? Data()
+        return String(decoding: data, as: UTF8.self)
     }
 
-    // MARK: - Memory sampler
+    // MARK: - Memory sampler (REMOVED)
 
-    /// Log one memory sample immediately. Marked `nonisolated` so it’s safe from any thread.
+    // Fully disabled (Release *and* Debug).
+    static func startMemorySampler(tag: String = "") { /* disabled */ }
+    static func stopMemorySampler() { /* disabled */ }
+
+    /// Log one snapshot of memory footprint (safe from any thread).
     nonisolated static func logMemory(_ label: String = "") {
         let mb = footprintMB()
         if mb >= 0 {
@@ -81,34 +89,9 @@ enum Diagnostics {
         }
     }
 
-    /// Start logging memory footprint every second.
-    static func startMemorySampler(tag: String = "") {
-        if memTimer != nil { return }
-        let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        t.schedule(deadline: .now(), repeating: .seconds(1))
-        t.setEventHandler {
-            let mb = footprintMB()
-            if mb >= 0 {
-                let formatted = String(format: "%.1f", mb)
-                log(.info, "footprint=\(formatted) MB \(tag)", category: "mem")
-            }
-        }
-        memTimer = t
-        t.resume()
-        log(.info, "Memory sampler STARTED \(tag)", category: "mem")
-    }
-
-    /// Stop the periodic memory sampler.
-    static func stopMemorySampler() {
-        memTimer?.cancel()
-        memTimer = nil
-        log(.info, "Memory sampler STOPPED", category: "mem")
-    }
-
     /// Returns current process physical footprint in MB (or -1 on failure).
     nonisolated private static func footprintMB() -> Double {
         var info = task_vm_info_data_t()
-        // FIX: specify generic types for MemoryLayout
         var count = mach_msg_type_number_t(
             MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<integer_t>.stride
         )
@@ -122,12 +105,15 @@ enum Diagnostics {
         return Double(bytes) / 1_048_576.0
     }
 
-    // MARK: - Clear / purge
+    // MARK: - Clear / report
 
-    /// Clears the rolling logs (current + backup), removes saved MetricKit payloads, and clears the crash marker.
     static func clearAll() async {
-        await store.clear()
+        let (fileURL, backupURL) = logURLs()
         let fm = FileManager.default
+        try? fm.removeItem(at: backupURL)
+        try? fm.removeItem(at: fileURL)
+        fm.createFile(atPath: fileURL.path, contents: nil)
+
         let dir = diagnosticsDir()
         if let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
             for url in files {
@@ -139,8 +125,6 @@ enum Diagnostics {
         }
     }
 
-    // MARK: - Report / share
-
     static func makeTextReport() async throws -> URL {
         let summary = await MainActor.run { deviceSummary() }
         let header = """
@@ -149,14 +133,14 @@ enum Diagnostics {
         \(summary)
         Last run crashed: \(didCrashLastLaunch ? "YES" : "NO")
         ===================================
-        
+
         --- Recent Log (last 64KB) ---
         """
         var body = header
         body += await tail(64 * 1024)
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("Diagnostics-\(Int(Date().timeIntervalSince1970)).txt")
-        try body.write(to: url, atomically: true, encoding: .utf8)
+        try body.write(to: url, atomically: true, encoding: String.Encoding.utf8)
         return url
     }
 
@@ -183,12 +167,12 @@ enum Diagnostics {
         }) else {
             return nil
         }
-        return try? String(contentsOf: latest, encoding: .utf8)
+        return try? String(contentsOf: latest, encoding: String.Encoding.utf8)
     }
 
     static func lastCrashSummary() -> String? {
         guard let text = lastCrashJSON(),
-              let data = text.data(using: .utf8),
+              let data = text.data(using: String.Encoding.utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
@@ -330,70 +314,49 @@ enum Diagnostics {
         return "App \(v) (\(build)) — iOS \(d.systemVersion) — \(d.model)"
     }
 
+    /// ICU-free timestamp like 2025-09-19T21:23:18.540Z
     nonisolated static func timestamp() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f.string(from: Date())
+        var t = time(nil)
+        var g = tm()
+        gmtime_r(&t, &g)
+        let now = Date().timeIntervalSince1970
+        let ms = Int((now - floor(now)) * 1000.0)
+        return String(
+            format: "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+            g.tm_year + 1900, g.tm_mon + 1, g.tm_mday,
+            g.tm_hour, g.tm_min, g.tm_sec, ms
+        )
     }
-}
 
-// MARK: - Actor: rolling file store
+    // MARK: - Private file helpers
 
-actor LogStore {
-    private let fm = FileManager.default
-    private let fileURL: URL
-    private let backupURL: URL
-    private let maxBytes = 512 * 1024
-
-    init() {
-        let dir = Diagnostics.diagnosticsDir()
-        self.fileURL = dir.appendingPathComponent("app.log")
-        self.backupURL = dir.appendingPathComponent("app.1.log")
+    nonisolated private static func appendLine(_ line: String) {
+        let fm = FileManager.default
+        let (fileURL, backupURL) = logURLs()
         if !fm.fileExists(atPath: fileURL.path) {
             fm.createFile(atPath: fileURL.path, contents: nil)
         }
-    }
-
-    func append(_ line: String) {
-        guard let data = (line + "\n").data(using: .utf8) else { return }
-        if !fm.fileExists(atPath: fileURL.path) {
-            fm.createFile(atPath: fileURL.path, contents: nil)
-        }
-        if let handle = try? FileHandle(forWritingTo: fileURL) {
-            defer { try? handle.close() }
-            do {
-                try handle.seekToEnd()
-                try handle.write(contentsOf: data)
-            } catch {
-                /* ignore */
-            }
-        }
-        rotateIfNeeded()
-    }
-
-    func tail(_ maxBytes: Int) -> String {
-        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return "" }
+        guard let data = (line + "\n").data(using: .utf8),
+              let handle = try? FileHandle(forWritingTo: fileURL) else { return }
         defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let off = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
-        try? handle.seek(toOffset: off)
-        let data = (try? handle.readToEnd()) ?? Data()
-        return String(decoding: data, as: UTF8.self)
-    }
-
-    func clear() {
-        try? fm.removeItem(at: backupURL)
-        try? fm.removeItem(at: fileURL)
-        fm.createFile(atPath: fileURL.path, contents: nil)
-    }
-
-    private func rotateIfNeeded() {
-        guard let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
-              let size = (attrs[.size] as? NSNumber)?.intValue else { return }
-        if size > maxBytes {
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch { /* ignore */ }
+        if let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
+           let size = (attrs[.size] as? NSNumber)?.intValue,
+           size > 512 * 1024 {
             try? fm.removeItem(at: backupURL)
             try? fm.moveItem(at: fileURL, to: backupURL)
             fm.createFile(atPath: fileURL.path, contents: nil)
         }
+    }
+
+    nonisolated private static func logURLs() -> (URL, URL) {
+        let dir = diagnosticsDir()
+        return (
+            dir.appendingPathComponent("app.log"),
+            dir.appendingPathComponent("app.1.log")
+        )
     }
 }

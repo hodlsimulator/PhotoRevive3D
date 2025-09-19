@@ -75,54 +75,37 @@ struct ContentView: View {
             Task { await loadImage(item: newItem) }
         }
 
-        // Gyro toggle — defer to next main-tick to avoid re-entrancy.
-        .onChange(of: useMotion) { _, enabled in
-            DispatchQueue.main.async {
-                if enabled {
+        // Gyro ON/OFF side-effects run after view updates (no re-entrancy)
+        .task(id: useMotion) {
+            await Task.yield()
+            await MainActor.run {
+                if useMotion {
                     Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
-                    Diagnostics.startMemorySampler(tag: "[gyro]")
                     motion.start()
-                    // Also defer the first preview kick.
-                    DispatchQueue.main.async { schedulePreview() }
+                    schedulePreview()
                 } else {
                     Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
-                    Diagnostics.stopMemorySampler()
                     motion.stop()
                 }
             }
         }
 
         // Live updates — coalesced
-        .onChange(of: motion.yaw) { _, _ in
-            if useMotion { schedulePreview() }
-        }
-        .onChange(of: motion.pitch) { _, _ in
-            if useMotion { schedulePreview() }
-        }
-        .onChange(of: intensity) { _, _ in
-            schedulePreview()
-        }
-        .onChange(of: yaw) { _, _ in
-            if !useMotion { schedulePreview() }
-        }
-        .onChange(of: pitch) { _, _ in
-            if !useMotion { schedulePreview() }
-        }
+        .onChange(of: motion.yaw) { _, _ in if useMotion { schedulePreview() } }
+        .onChange(of: motion.pitch) { _, _ in if useMotion { schedulePreview() } }
+        .onChange(of: intensity) { _, _ in schedulePreview() }
+        .onChange(of: yaw) { _, _ in if !useMotion { schedulePreview() } }
+        .onChange(of: pitch) { _, _ in if !useMotion { schedulePreview() } }
         .onDisappear {
-            // Safety: ensure sensors are off when view disappears.
-            if useMotion {
-                Diagnostics.stopMemorySampler()
-                motion.stop()
-            }
+            if useMotion { motion.stop() }
         }
     }
 
-    // MARK: - UI Pieces
+    // MARK: - UI
 
     private var headerBar: some View {
         HStack {
-            Text("PhotoRevive 3D")
-                .font(.title2.weight(.bold))
+            Text("PhotoRevive 3D").font(.title2.weight(.bold))
             Spacer()
             PhotosPicker(selection: $pickerItem, matching: .images) {
                 Label("Pick Photo", systemImage: "photo.on.rectangle.angled")
@@ -136,12 +119,9 @@ struct ContentView: View {
     private var placeholderCard: some View {
         VStack(spacing: 12) {
             Image(systemName: "photo.artframe")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 80)
+                .resizable().scaledToFit().frame(width: 80)
                 .foregroundStyle(.secondary)
-            Text("Pick a photo to begin")
-                .foregroundStyle(.secondary)
+            Text("Pick a photo to begin").foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, minHeight: 260)
         .glassCard()
@@ -152,8 +132,7 @@ struct ContentView: View {
             CIRenderView(image: $previewCI)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             if previewCI == nil {
-                ProgressView()
-                    .frame(maxWidth: .infinity, minHeight: 200)
+                ProgressView().frame(maxWidth: .infinity, minHeight: 200)
             }
         }
         .overlay(
@@ -189,45 +168,24 @@ struct ContentView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Parallax Intensity")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                    Text("Parallax Intensity").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
                     Slider(
-                        value: Binding(
-                            get: { Double(intensity) },
-                            set: { intensity = CGFloat($0) }
-                        ),
+                        value: Binding(get: { Double(intensity) }, set: { intensity = CGFloat($0) }),
                         in: 0.2...1.0
                     )
                 }
 
                 if !useMotion {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Manual Tilt")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(.secondary)
-
+                        Text("Manual Tilt").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
                         HStack {
                             Image(systemName: "arrow.left")
-                            Slider(
-                                value: Binding(
-                                    get: { Double(yaw) },
-                                    set: { yaw = CGFloat($0) }
-                                ),
-                                in: -1.0...1.0
-                            )
+                            Slider(value: Binding(get: { Double(yaw) }, set: { yaw = CGFloat($0) }), in: -1...1)
                             Image(systemName: "arrow.right")
                         }
-
                         HStack {
                             Image(systemName: "arrow.down")
-                            Slider(
-                                value: Binding(
-                                    get: { Double(pitch) },
-                                    set: { pitch = CGFloat($0) }
-                                ),
-                                in: -1.0...1.0
-                            )
+                            Slider(value: Binding(get: { Double(pitch) }, set: { pitch = CGFloat($0) }), in: -1...1)
                             Image(systemName: "arrow.up")
                         }
                     }
@@ -242,23 +200,17 @@ struct ContentView: View {
                 GroupBox {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
-                            Text("Export Options")
-                                .font(.subheadline.weight(.semibold))
+                            Text("Export Options").font(.subheadline.weight(.semibold))
                             Spacer()
                         }
-
                         HStack(spacing: 16) {
                             VStack(alignment: .leading) {
-                                let secs = exportSeconds.formatted(.number.precision(.fractionLength(1)))
-                                Text("Duration \(secs)s")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                let secs = String(format: "%.1f", exportSeconds)
+                                Text("Duration \(secs)s").font(.caption).foregroundStyle(.secondary)
                                 Slider(value: $exportSeconds, in: 2.0...8.0, step: 0.5)
                             }
                             VStack(alignment: .leading) {
-                                Text("FPS \(exportFPS)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                Text("FPS \(exportFPS)").font(.caption).foregroundStyle(.secondary)
                                 Picker("", selection: $exportFPS) {
                                     Text("24").tag(24)
                                     Text("30").tag(30)
@@ -268,11 +220,8 @@ struct ContentView: View {
                                 .frame(maxWidth: 200)
                             }
                         }
-
                         VStack(alignment: .leading) {
-                            Text("Motion Curve")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text("Motion Curve").font(.caption).foregroundStyle(.secondary)
                             Picker("", selection: $exportCurve) {
                                 Text("Linear").tag(ExportOptions.MotionCurve.linear)
                                 Text("Smooth").tag(ExportOptions.MotionCurve.easeInOut)
@@ -291,15 +240,12 @@ struct ContentView: View {
                     .disabled(preparing || exporting)
 
                     if exporting {
-                        ProgressView(value: exportProgress)
-                            .frame(width: 120)
-
+                        ProgressView(value: exportProgress).frame(width: 120)
                         Button(role: .destructive) { exportTask?.cancel() } label: {
                             Label("Cancel", systemImage: "xmark.circle")
                         }
                         .buttonStyle(.bordered)
                     }
-
                     Spacer()
                 }
             }
@@ -329,7 +275,7 @@ struct ContentView: View {
                     self.pitch = 0
                 }
                 Diagnostics.log(.info, "Image loaded; engine prepared (size=\(engine.outputSize.width)x\(engine.outputSize.height))", category: "engine")
-                schedulePreview() // first preview
+                schedulePreview()
             }
         } catch {
             Diagnostics.log(.error, "Image load/prepare error: \(error)", category: "engine")
@@ -360,7 +306,6 @@ struct ContentView: View {
                 ) { progress in
                     Task { @MainActor in exportProgress = progress }
                 }
-
                 await MainActor.run {
                     exporting = false
                     shareSheet = ShareSheet(items: [url])
@@ -390,17 +335,12 @@ struct ContentView: View {
 
     private func currentParams() -> (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)? {
         guard engine != nil else { return nil }
-        if useMotion {
-            return (CGFloat(motion.yaw), CGFloat(motion.pitch), intensity)
-        } else {
-            return (yaw, pitch, intensity)
-        }
+        if useMotion { return (CGFloat(motion.yaw), CGFloat(motion.pitch), intensity) }
+        else { return (yaw, pitch, intensity) }
     }
 
     private func schedulePreview() {
         guard let params = currentParams() else { return }
-
-        // Defer state mutation to the next main run-loop tick to avoid traps.
         DispatchQueue.main.async {
             self.pendingParams = params
             guard !self.renderInFlight else { return }
@@ -410,7 +350,6 @@ struct ContentView: View {
                 var frames = 0
                 var loggedStart = false
                 while true {
-                    // Fetch snapshot + coalesced params atomically on the main actor.
                     let fetched = await MainActor.run { () -> (ParallaxEngine.PreviewSnapshot, (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat), CGFloat)? in
                         guard let snap = self.engine?.makePreviewSnapshot(),
                               let next = self.pendingParams else { return nil }
@@ -427,7 +366,6 @@ struct ContentView: View {
                         Diagnostics.logMemory("[preview.start]")
                     }
 
-                    // Compose off-main (pure function).
                     let ci = ParallaxEngine.composePreview(from: snapshot, yaw: next.yaw, pitch: next.pitch, intensity: next.intensity)
                     frames += 1
                     if frames % 60 == 0 { Diagnostics.logMemory("[preview.frames=\(frames)]") }
