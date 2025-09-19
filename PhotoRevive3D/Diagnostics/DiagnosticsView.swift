@@ -13,6 +13,8 @@ struct DiagnosticsView: View {
     @State private var summary: String = ""
     @State private var confirmClear = false
     @State private var copied = false
+    @State private var copiedCrash = false
+    @State private var copiedCrashSummary = false
 
     var body: some View {
         NavigationStack {
@@ -55,7 +57,6 @@ struct DiagnosticsView: View {
                         Label(copied ? "Copied" : "Copy All", systemImage: copied ? "checkmark" : "doc.on.doc")
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(logTail.isEmpty && summary.isEmpty)
 
                     Button {
                         Task { await refresh() }
@@ -74,11 +75,31 @@ struct DiagnosticsView: View {
                     Spacer()
                 }
 
-                if copied {
-                    Text("Copied to clipboard.")
-                        .font(.footnote)
+                GroupBox {
+                    Text("Crash Tools")
+                        .font(.footnote.weight(.semibold))
                         .foregroundStyle(.secondary)
-                        .transition(.opacity)
+                    HStack(spacing: 12) {
+                        Button {
+                            if let s = Diagnostics.lastCrashSummary() {
+                                UIPasteboard.general.string = s
+                                withAnimation { copiedCrashSummary = true }
+                            }
+                        } label: {
+                            Label(copiedCrashSummary ? "Summary Copied" : "Copy Crash Summary", systemImage: copiedCrashSummary ? "checkmark" : "text.document")
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button {
+                            if let json = Diagnostics.lastCrashJSON() {
+                                UIPasteboard.general.string = json
+                                withAnimation { copiedCrash = true }
+                            }
+                        } label: {
+                            Label(copiedCrash ? "JSON Copied" : "Copy Crash JSON", systemImage: copiedCrash ? "checkmark" : "curlybraces")
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
 
                 Spacer(minLength: 8)
@@ -86,10 +107,21 @@ struct DiagnosticsView: View {
             .padding()
             .navigationBarTitleDisplayMode(.inline)
         }
-        .task { await initialLoad() }
+        .task {
+            let text = await Diagnostics.tail()
+            let s = await MainActor.run { Diagnostics.deviceSummary() }
+            await MainActor.run {
+                logTail = text
+                summary = s
+            }
+        }
         .alert("Clear diagnostics?", isPresented: $confirmClear) {
             Button("Clear", role: .destructive) {
-                Task { await clearAndRefresh() }
+                Task {
+                    await Diagnostics.clearAll()
+                    let text = await Diagnostics.tail()
+                    await MainActor.run { logTail = text }
+                }
             }
             Button("Cancel", role: .cancel) { }
         } message: {
@@ -99,34 +131,15 @@ struct DiagnosticsView: View {
 
     // MARK: - Actions
 
-    private func initialLoad() async {
-        let text = await Diagnostics.tail()
-        let s = await MainActor.run { Diagnostics.deviceSummary() }
-        await MainActor.run {
-            logTail = text
-            summary = s
-        }
-    }
-
     private func refresh() async {
         let text = await Diagnostics.tail()
         await MainActor.run {
-            withAnimation { copied = false }
-            logTail = text
-        }
-    }
-
-    private func clearAndRefresh() async {
-        await Diagnostics.clearAll()
-        let text = await Diagnostics.tail()
-        await MainActor.run {
-            withAnimation { copied = false }
+            withAnimation { copied = false; copiedCrash = false; copiedCrashSummary = false }
             logTail = text
         }
     }
 
     private func copyAll() async {
-        // Build a fresh, single text blob and copy it to the clipboard.
         let text = await Diagnostics.tail()
         let ts = Diagnostics.timestamp()
         let s = await MainActor.run { Diagnostics.deviceSummary() }

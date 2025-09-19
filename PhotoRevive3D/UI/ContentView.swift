@@ -24,8 +24,8 @@ struct ContentView: View {
     @State private var useMotion = false
 
     // Export options
-    @State private var exportSeconds: Double = 4.0 // 2…8
-    @State private var exportFPS: Int = 30         // 24/30/60
+    @State private var exportSeconds: Double = 4.0
+    @State private var exportFPS: Int = 30
     @State private var exportCurve: ExportOptions.MotionCurve = .easeInOut
 
     // State
@@ -35,8 +35,8 @@ struct ContentView: View {
     @State private var exportTask: Task<Void, Never>?
     @State private var shareSheet: ShareSheet?
 
-    // Coalesced preview rendering (off-main)
-    @State private var previewImage: UIImage?
+    // Coalesced preview rendering (off-main, CIImage -> Metal)
+    @State private var previewCI: CIImage?
     @State private var renderInFlight = false
     @State private var pendingParams: (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)?
 
@@ -77,10 +77,12 @@ struct ContentView: View {
         .onChange(of: useMotion) { _, enabled in
             if enabled {
                 Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
+                Diagnostics.startMemorySampler(tag: "[gyro]")
                 motion.start()
                 schedulePreview()
             } else {
                 Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
+                Diagnostics.stopMemorySampler()
                 motion.stop()
             }
         }
@@ -125,18 +127,14 @@ struct ContentView: View {
 
     private var previewCard: some View {
         ZStack {
-            if let image = previewImage {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            } else {
+            CIRenderView(image: $previewCI)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+            if previewCI == nil {
                 ProgressView()
                     .frame(maxWidth: .infinity, minHeight: 200)
             }
         }
-        // Measure the actual displayed size (in points), convert to pixels with displayScale,
-        // and update the engine’s preview LOD to match the screen.
         .overlay(
             GeometryReader { geo in
                 Color.clear
@@ -210,7 +208,6 @@ struct ContentView: View {
     private var exportBar: some View {
         VStack(alignment: .leading, spacing: 12) {
             if engine != nil {
-                // Export options
                 GroupBox {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
@@ -252,7 +249,6 @@ struct ContentView: View {
                     }
                 }
 
-                // Export buttons + progress
                 HStack(spacing: 12) {
                     Button { startExport() } label: {
                         Label("Export Video", systemImage: "square.and.arrow.up")
@@ -346,7 +342,6 @@ struct ContentView: View {
 
     // MARK: - Preview LOD + coalesced renderer
 
-    /// Update engine preview LOD based on the on-screen size (in points → pixels).
     private func updateLODFrom(size: CGSize) {
         guard size.width > 0, size.height > 0, let eng = engine else { return }
         let longestPx = max(size.width, size.height) * displayScale
@@ -374,38 +369,41 @@ struct ContentView: View {
         renderInFlight = true
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // Local CIContext used only on this background thread.
-            let context = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
             var frames = 0
+            var loggedStart = false // local flag; avoids touching @State from background
 
             while true {
                 // Pull latest params + snapshot on main (fast), clear pending (coalesce).
                 var snap: ParallaxEngine.PreviewSnapshot?
                 var next: (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)?
+                var lodPx: CGFloat = 0
                 DispatchQueue.main.sync {
                     snap = self.engine?.makePreviewSnapshot()
+                    lodPx = self.engine?.previewTargetLongest ?? 0
                     next = self.pendingParams
                     self.pendingParams = nil
                 }
                 guard let snapshot = snap, let params = next else { break }
 
-                // Compose off-main.
+                if !loggedStart {
+                    loggedStart = true
+                    Diagnostics.log(.info, "preview.start LOD=\(Int(lodPx))px snap=\(Int(snapshot.size.width))x\(Int(snapshot.size.height))", category: "preview")
+                    Diagnostics.logMemory("[preview.start]")
+                }
+
+                // Compose off-main (pure function).
                 let ci = ParallaxEngine.composePreview(from: snapshot,
                                                        yaw: params.yaw,
                                                        pitch: params.pitch,
                                                        intensity: params.intensity)
 
-                // Convert CI → CG → UIImage off-main (tight autorelease scope).
-                let image: UIImage? = autoreleasepool {
-                    guard let cg = context.createCGImage(ci, from: ci.extent) else { return nil }
-                    return UIImage(cgImage: cg)
+                frames += 1
+                if frames % 60 == 0 {
+                    Diagnostics.logMemory("[preview.frames=\(frames)]")
                 }
 
-                frames += 1
-                if (frames % 30) == 0 { context.clearCaches() }
-
                 DispatchQueue.main.async {
-                    self.previewImage = image
+                    self.previewCI = ci
                 }
             }
 
