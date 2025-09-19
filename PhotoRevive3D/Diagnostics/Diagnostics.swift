@@ -20,7 +20,6 @@ enum Diagnostics {
     private static var memTimer: DispatchSourceTimer?
 
     // MARK: - Bootstrap / lifecycle
-
     static func bootstrap() {
         markLaunch()
         MetricsSubscriber.shared.start()
@@ -74,9 +73,10 @@ enum Diagnostics {
     nonisolated static func logMemory(_ label: String = "") {
         let mb = footprintMB()
         if mb >= 0 {
-            log(.info, "footprint=\(String(format: "%.1f", mb)) MB \(label)", category: "mem")
+            let formatted = mb.formatted(.number.precision(.fractionLength(1)))
+            log(.info, "footprint=\(formatted) MB \(label)", category: "mem")
         } else {
-            log(.warn, "footprint=<unavailable> \(label)", category: "mem")
+            log(.warn, "footprint= \(label)", category: "mem")
         }
     }
 
@@ -88,7 +88,8 @@ enum Diagnostics {
         t.setEventHandler {
             let mb = footprintMB()
             if mb >= 0 {
-                log(.info, "footprint=\(String(format: "%.1f", mb)) MB \(tag)", category: "mem")
+                let formatted = mb.formatted(.number.precision(.fractionLength(1)))
+                log(.info, "footprint=\(formatted) MB \(tag)", category: "mem")
             }
         }
         memTimer = t
@@ -122,10 +123,8 @@ enum Diagnostics {
     /// Clears the rolling logs (current + backup), removes saved MetricKit payloads, and clears the crash marker.
     static func clearAll() async {
         await store.clear()
-
         let fm = FileManager.default
         let dir = diagnosticsDir()
-
         if let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
             for url in files {
                 let name = url.lastPathComponent
@@ -140,7 +139,6 @@ enum Diagnostics {
 
     static func makeTextReport() async throws -> URL {
         let summary = await MainActor.run { deviceSummary() }
-
         let header = """
         ==== PhotoRevive3D Diagnostics ====
         Time: \(timestamp())
@@ -150,103 +148,75 @@ enum Diagnostics {
 
         --- Recent Log (last 64KB) ---
         """
-
         var body = header
         body += await tail(64 * 1024)
 
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("Diagnostics-\(Int(Date().timeIntervalSince1970)).txt")
-
         try body.write(to: url, atomically: true, encoding: .utf8)
         return url
     }
 
     static func collectShareURLs() async -> [URL] {
         var urls: [URL] = []
-        if let rep = try? await makeTextReport() {
-            urls.append(rep)
-        }
+        if let rep = try? await makeTextReport() { urls.append(rep) }
         urls.append(contentsOf: MetricsSubscriber.shared.savedPayloads())
         return urls
     }
 
     // MARK: - Crash JSON helpers
 
-    /// Raw JSON for the most recent saved MX diagnostic.
     static func lastCrashJSON() -> String? {
         let dir = diagnosticsDir()
         let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else {
-            return nil
-        }
-        let candidates = files.filter { $0.lastPathComponent.hasPrefix("MXDiag-") && $0.pathExtension == "json" }
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return nil }
+        let candidates = files.filter { $0.lastPathComponent.hasPrefix("MX") && $0.pathExtension == "json" }
         guard let latest = candidates.max(by: { (a, b) -> Bool in
             let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return da < db
-        }) else {
-            return nil
-        }
+        }) else { return nil }
         return try? String(contentsOf: latest, encoding: .utf8)
     }
 
-    /// Very small summary parsed from the latest crash JSON (termination reason, signal/exception, footprint).
     static func lastCrashSummary() -> String? {
         guard let text = lastCrashJSON(),
               let data = text.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
 
-        // Pick first available diagnostic bucket
         let buckets = ["crashDiagnostics", "cpuExceptionDiagnostics", "hangDiagnostics"]
         var diag: [String: Any]? = nil
         for key in buckets {
-            if let arr = root[key] as? [[String: Any]], let first = arr.first {
-                diag = first
-                break
-            }
+            if let arr = root[key] as? [[String: Any]], let first = arr.first { diag = first; break }
         }
         guard let diag else { return "No crash diagnostics array found." }
 
         var lines: [String] = []
+        if let ts = root["timeStampEnd"] as? String { lines.append("time=\(ts)") }
 
-        // Timestamp (from top level if present)
-        if let ts = root["timeStampEnd"] as? String {
-            lines.append("time=\(ts)")
-        }
-
-        // Meta fields (where signal/exception live in your sample)
         if let meta = diag["diagnosticMetaData"] as? [String: Any] {
             let sig = intFrom(meta["signal"])
             let exc = intFrom(meta["exceptionType"])
             let excCode = intFrom(meta["exceptionCode"])
-
             var parts: [String] = []
             if let s = sig { parts.append("signal=\(s) (\(signalName(s)))") }
             if let e = exc { parts.append("exceptionType=\(e) (\(machExceptionName(e)))") }
             if let c = excCode { parts.append("code=\(c)") }
-            if !parts.isEmpty { lines.append(parts.joined(separator: "  ")) }
+            if !parts.isEmpty { lines.append(parts.joined(separator: " ")) }
 
             var env: [String] = []
             if let bid = meta["bundleIdentifier"] as? String { env.append("bundle=\(bid)") }
-            if let v = meta["appVersion"] as? String, let b = meta["appBuildVersion"] as? String {
-                env.append("app=\(v) (\(b))")
-            }
+            if let v = meta["appVersion"] as? String, let b = meta["appBuildVersion"] as? String { env.append("app=\(v) (\(b))") }
             if let os = meta["osVersion"] as? String { env.append("os=\(os)") }
             if let device = meta["deviceType"] as? String { env.append("device=\(device)") }
             if let pidAny = meta["pid"] { env.append("pid=\(pidAny)") }
-            if !env.isEmpty { lines.append(env.joined(separator: "  ")) }
+            if !env.isEmpty { lines.append(env.joined(separator: " ")) }
         }
 
-        // Some payloads include this at top-level
-        if let term = diag["terminationReason"] {
-            lines.append("terminationReason=\(term)")
-        }
+        if let term = diag["terminationReason"] { lines.append("terminationReason=\(term)") }
 
-        // Extract a "top frame" (prefer our app) from callStackTree
         if let tree = diag["callStackTree"] as? [String: Any],
            let stacks = tree["callStacks"] as? [[String: Any]] {
-            // Prefer the attributed (crashing) thread if present
             let chosen = stacks.first(where: { ($0["threadAttributed"] as? Bool) == true }) ?? stacks.first
             if let frames = chosen?["callStackRootFrames"] as? [[String: Any]],
                let (name, off) = firstUsefulFrame(from: frames, preferBinary: "PhotoRevive3D") {
@@ -258,7 +228,7 @@ enum Diagnostics {
         return lines.isEmpty ? "Crash diagnostic present but no standard fields." : lines.joined(separator: "\n")
     }
 
-    // MARK: - Helpers (place inside Diagnostics)
+    // MARK: - Helpers
 
     private static func intFrom(_ any: Any?) -> Int? {
         if let i = any as? Int { return i }
@@ -268,17 +238,13 @@ enum Diagnostics {
     }
 
     private static func firstUsefulFrame(from frames: [[String: Any]], preferBinary: String) -> (name: String, offset: Int)? {
-        // Breadth-first search through root frames + subFrames
         var queue: [[String: Any]] = frames
         var fallback: (String, Int)? = nil
-
         while !queue.isEmpty {
             let f = queue.removeFirst()
             let name = f["binaryName"] as? String
             let off = intFrom(f["offsetIntoBinaryTextSegment"])
-            if let subs = f["subFrames"] as? [[String: Any]] {
-                queue.append(contentsOf: subs)
-            }
+            if let subs = f["subFrames"] as? [[String: Any]] { queue.append(contentsOf: subs) }
             if let name, let off {
                 if name == preferBinary { return (name, off) }
                 if fallback == nil { fallback = (name, off) }
@@ -327,13 +293,10 @@ enum Diagnostics {
         }
     }
 
-    // MARK: - Paths / helpers
-
     private static func markerURL() -> URL {
         diagnosticsDir().appendingPathComponent("RUNNING.marker")
     }
 
-    /// Pure Foundation; safe from any context.
     nonisolated static func diagnosticsDir() -> URL {
         let fm = FileManager.default
         let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -344,12 +307,12 @@ enum Diagnostics {
         return dir
     }
 
-    /// Subsystem for os.Logger; keep it callable from any context.
     nonisolated static func subsystem() -> String {
         Bundle.main.bundleIdentifier ?? "PhotoRevive3D"
     }
 
-    @MainActor static func deviceSummary() -> String {
+    @MainActor
+    static func deviceSummary() -> String {
         let b = Bundle.main
         let v = b.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         let build = b.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
@@ -383,7 +346,6 @@ actor LogStore {
 
     func append(_ line: String) {
         guard let data = (line + "\n").data(using: .utf8) else { return }
-
         if !fm.fileExists(atPath: fileURL.path) {
             fm.createFile(atPath: fileURL.path, contents: nil)
         }
@@ -392,7 +354,9 @@ actor LogStore {
             do {
                 try handle.seekToEnd()
                 try handle.write(contentsOf: data)
-            } catch { /* ignore */ }
+            } catch {
+                /* ignore */
+            }
         }
         rotateIfNeeded()
     }
@@ -400,7 +364,6 @@ actor LogStore {
     func tail(_ maxBytes: Int) -> String {
         guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return "" }
         defer { try? handle.close() }
-
         let size = (try? handle.seekToEnd()) ?? 0
         let off = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
         try? handle.seek(toOffset: off)
@@ -415,11 +378,8 @@ actor LogStore {
     }
 
     private func rotateIfNeeded() {
-        guard
-            let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
-            let size = (attrs[.size] as? NSNumber)?.intValue
-        else { return }
-
+        guard let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
+              let size = (attrs[.size] as? NSNumber)?.intValue else { return }
         if size > maxBytes {
             try? fm.removeItem(at: backupURL)
             try? fm.moveItem(at: fileURL, to: backupURL)

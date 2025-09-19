@@ -5,6 +5,7 @@
 //  Created by . . on 19/09/2025.
 //
 
+import Foundation
 import SwiftUI
 import PhotosUI
 import CoreMotion
@@ -32,13 +33,15 @@ struct ContentView: View {
     @State private var preparing = false
     @State private var exporting = false
     @State private var exportProgress: Double = 0.0
-    @State private var exportTask: Task<Void, Never>?
+    @State private var exportTask: Task<Void, Error>?
+
     @State private var shareSheet: ShareSheet?
 
-    // Coalesced preview rendering (off-main, CIImage -> Metal)
+    // Coalesced preview rendering
     @State private var previewCI: CIImage?
     @State private var renderInFlight = false
     @State private var pendingParams: (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)?
+    @State private var previewTask: Task<Void, Never>?
 
     @StateObject private var motion = MotionTiltProvider()
 
@@ -129,7 +132,6 @@ struct ContentView: View {
         ZStack {
             CIRenderView(image: $previewCI)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-
             if previewCI == nil {
                 ProgressView()
                     .frame(maxWidth: .infinity, minHeight: 200)
@@ -154,9 +156,7 @@ struct ContentView: View {
                         Label("Gyro", systemImage: "gyroscope")
                     }
                     .toggleStyle(.switch)
-
                     Spacer()
-
                     Button {
                         yaw = 0; pitch = 0
                         Diagnostics.log(.debug, "Manual centre applied", category: "gyro")
@@ -171,7 +171,6 @@ struct ContentView: View {
                     Text("Parallax Intensity")
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(.secondary)
-
                     Slider(value: Binding(
                         get: { Double(intensity) },
                         set: { intensity = CGFloat($0) }
@@ -217,7 +216,8 @@ struct ContentView: View {
                         }
                         HStack(spacing: 16) {
                             VStack(alignment: .leading) {
-                                Text("Duration \(String(format: "%.1f", exportSeconds))s")
+                                let secs = exportSeconds.formatted(.number.precision(.fractionLength(1)))
+                                Text("Duration \(secs)s")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                 Slider(value: $exportSeconds, in: 2.0...8.0, step: 0.5)
@@ -293,7 +293,9 @@ struct ContentView: View {
                     self.yaw = 0
                     self.pitch = 0
                 }
-                Diagnostics.log(.info, "Image loaded; engine prepared (size=\(engine.outputSize.width)x\(engine.outputSize.height))", category: "engine")
+                Diagnostics.log(.info,
+                                "Image loaded; engine prepared (size=\(engine.outputSize.width)x\(engine.outputSize.height))",
+                                category: "engine")
                 schedulePreview() // first preview
             }
         } catch {
@@ -315,7 +317,8 @@ struct ContentView: View {
             curve: exportCurve
         )
 
-        Diagnostics.log(.info, "Export started (duration=\(exportSeconds)s, fps=\(exportFPS))", category: "export")
+        Diagnostics.log(.info, "Export started (duration=\(exportSeconds)s, fps=\(exportFPS))",
+                        category: "export")
 
         exportTask = Task(priority: .userInitiated) {
             do {
@@ -325,6 +328,7 @@ struct ContentView: View {
                 ) { progress in
                     Task { @MainActor in exportProgress = progress }
                 }
+
                 await MainActor.run {
                     exporting = false
                     shareSheet = ShareSheet(items: [url])
@@ -363,52 +367,57 @@ struct ContentView: View {
 
     private func schedulePreview() {
         guard let params = currentParams() else { return }
-        pendingParams = params
-        guard !renderInFlight else { return }
 
-        renderInFlight = true
+        // Defer state mutation to the next main runloop tick to avoid
+        // “modifying state during view update” traps.
+        Task { @MainActor in
+            pendingParams = params
+            guard !renderInFlight else { return }
+            renderInFlight = true
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            var frames = 0
-            var loggedStart = false // local flag; avoids touching @State from background
+            previewTask = Task.detached(priority: .userInitiated) {
+                var frames = 0
+                var loggedStart = false
 
-            while true {
-                // Pull latest params + snapshot on main (fast), clear pending (coalesce).
-                var snap: ParallaxEngine.PreviewSnapshot?
-                var next: (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)?
-                var lodPx: CGFloat = 0
-                DispatchQueue.main.sync {
-                    snap = self.engine?.makePreviewSnapshot()
-                    lodPx = self.engine?.previewTargetLongest ?? 0
-                    next = self.pendingParams
-                    self.pendingParams = nil
+                while true {
+                    // Fetch snapshot + coalesced params atomically on the main actor.
+                    let fetched = await MainActor.run { () -> (ParallaxEngine.PreviewSnapshot, (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat), CGFloat)? in
+                        guard let snap = self.engine?.makePreviewSnapshot(),
+                              let next = self.pendingParams else { return nil }
+                        let lodPx = self.engine?.previewTargetLongest ?? 0
+                        self.pendingParams = nil
+                        return (snap, next, lodPx)
+                    }
+
+                    guard let (snapshot, next, lodPx) = fetched else { break }
+
+                    if !loggedStart {
+                        loggedStart = true
+                        Diagnostics.log(.info,
+                                        "preview.start LOD=\(Int(lodPx))px snap=\(Int(snapshot.size.width))x\(Int(snapshot.size.height))",
+                                        category: "preview")
+                        Diagnostics.logMemory("[preview.start]")
+                    }
+
+                    // Compose off-main (pure function).
+                    let ci = ParallaxEngine.composePreview(from: snapshot,
+                                                           yaw: next.yaw,
+                                                           pitch: next.pitch,
+                                                           intensity: next.intensity)
+                    frames += 1
+                    if frames % 60 == 0 {
+                        Diagnostics.logMemory("[preview.frames=\(frames)]")
+                    }
+
+                    await MainActor.run {
+                        self.previewCI = ci
+                    }
                 }
-                guard let snapshot = snap, let params = next else { break }
 
-                if !loggedStart {
-                    loggedStart = true
-                    Diagnostics.log(.info, "preview.start LOD=\(Int(lodPx))px snap=\(Int(snapshot.size.width))x\(Int(snapshot.size.height))", category: "preview")
-                    Diagnostics.logMemory("[preview.start]")
+                await MainActor.run {
+                    self.renderInFlight = false
+                    self.previewTask = nil
                 }
-
-                // Compose off-main (pure function).
-                let ci = ParallaxEngine.composePreview(from: snapshot,
-                                                       yaw: params.yaw,
-                                                       pitch: params.pitch,
-                                                       intensity: params.intensity)
-
-                frames += 1
-                if frames % 60 == 0 {
-                    Diagnostics.logMemory("[preview.frames=\(frames)]")
-                }
-
-                DispatchQueue.main.async {
-                    self.previewCI = ci
-                }
-            }
-
-            DispatchQueue.main.async {
-                self.renderInFlight = false
             }
         }
     }

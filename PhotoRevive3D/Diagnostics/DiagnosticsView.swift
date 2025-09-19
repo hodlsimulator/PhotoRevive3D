@@ -10,8 +10,12 @@ import UIKit
 
 struct DiagnosticsView: View {
     @State private var logTail: String = ""
-    @State private var summary: String = ""
+    @State private var deviceSummary: String = ""
+    @State private var crashSummary: String = ""
+    @State private var hasCrashJSON: Bool = false
+
     @State private var confirmClear = false
+
     @State private var copied = false
     @State private var copiedCrash = false
     @State private var copiedCrashSummary = false
@@ -27,11 +31,35 @@ struct DiagnosticsView: View {
                 }
 
                 GroupBox {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(summary.isEmpty ? "…" : summary)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(deviceSummary.isEmpty ? "…" : deviceSummary)
                             .font(.subheadline)
+
                         Text("Last run crashed: \(Diagnostics.didCrashLastLaunch ? "YES" : "NO")")
                             .font(.subheadline)
+
+                        Divider().padding(.vertical, 4)
+
+                        HStack {
+                            Text("Latest crash summary")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            if hasCrashJSON {
+                                Text("available")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text("none")
+                                    .font(.footnote)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+
+                        Text(summaryText())
+                            .font(.system(.footnote, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
 
@@ -59,7 +87,7 @@ struct DiagnosticsView: View {
                     .buttonStyle(.borderedProminent)
 
                     Button {
-                        Task { await refresh() }
+                        Task { await refreshAll() }
                     } label: {
                         Label("Refresh", systemImage: "arrow.clockwise")
                     }
@@ -79,16 +107,19 @@ struct DiagnosticsView: View {
                     Text("Crash Tools")
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(.secondary)
+
                     HStack(spacing: 12) {
                         Button {
-                            if let s = Diagnostics.lastCrashSummary() {
-                                UIPasteboard.general.string = s
+                            if !crashSummary.isEmpty {
+                                UIPasteboard.general.string = crashSummary
                                 withAnimation { copiedCrashSummary = true }
                             }
                         } label: {
-                            Label(copiedCrashSummary ? "Summary Copied" : "Copy Crash Summary", systemImage: copiedCrashSummary ? "checkmark" : "text.document")
+                            Label(copiedCrashSummary ? "Summary Copied" : "Copy Crash Summary",
+                                  systemImage: copiedCrashSummary ? "checkmark" : "text.document")
                         }
                         .buttonStyle(.bordered)
+                        .disabled(!hasCrashJSON || crashSummary.isEmpty)
 
                         Button {
                             if let json = Diagnostics.lastCrashJSON() {
@@ -96,9 +127,11 @@ struct DiagnosticsView: View {
                                 withAnimation { copiedCrash = true }
                             }
                         } label: {
-                            Label(copiedCrash ? "JSON Copied" : "Copy Crash JSON", systemImage: copiedCrash ? "checkmark" : "curlybraces")
+                            Label(copiedCrash ? "JSON Copied" : "Copy Crash JSON",
+                                  systemImage: copiedCrash ? "checkmark" : "curlybraces")
                         }
                         .buttonStyle(.bordered)
+                        .disabled(!hasCrashJSON)
                     }
                 }
 
@@ -107,47 +140,68 @@ struct DiagnosticsView: View {
             .padding()
             .navigationBarTitleDisplayMode(.inline)
         }
-        .task {
-            let text = await Diagnostics.tail()
-            let s = await MainActor.run { Diagnostics.deviceSummary() }
-            await MainActor.run {
-                logTail = text
-                summary = s
-            }
-        }
+        .task { await refreshAll() }
         .alert("Clear diagnostics?", isPresented: $confirmClear) {
             Button("Clear", role: .destructive) {
                 Task {
+                    // Purge rolling logs, backup, ALL MetricKit JSON (MXMetric/MXDiag), and the crash marker.
                     await Diagnostics.clearAll()
-                    let text = await Diagnostics.tail()
-                    await MainActor.run { logTail = text }
+                    // Also reset in-memory UI state so JSON + summary appear cleared immediately.
+                    await MainActor.run {
+                        withAnimation {
+                            logTail = ""
+                            crashSummary = ""
+                            hasCrashJSON = false
+                            copied = false
+                            copiedCrash = false
+                            copiedCrashSummary = false
+                        }
+                    }
                 }
             }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("This deletes the rolling logs, backup, MetricKit payloads, and the crash marker.")
+            Text("This deletes the rolling logs, backups, MetricKit JSON payloads, and the crash marker. It also clears the displayed crash summary.")
         }
     }
 
-    // MARK: - Actions
+    // MARK: - Helpers
 
-    private func refresh() async {
+    private func summaryText() -> String {
+        if hasCrashJSON {
+            return crashSummary.isEmpty ? "No summary available in the latest payload." : crashSummary
+        } else {
+            return "No crash payload found."
+        }
+    }
+
+    private func refreshAll() async {
         let text = await Diagnostics.tail()
+        let dev = await MainActor.run { Diagnostics.deviceSummary() }
+        let sum = Diagnostics.lastCrashSummary() ?? ""
+        let has = Diagnostics.lastCrashJSON() != nil
+
         await MainActor.run {
-            withAnimation { copied = false; copiedCrash = false; copiedCrashSummary = false }
+            withAnimation {
+                copied = false
+                copiedCrash = false
+                copiedCrashSummary = false
+            }
             logTail = text
+            deviceSummary = dev
+            crashSummary = sum
+            hasCrashJSON = has
         }
     }
 
     private func copyAll() async {
         let text = await Diagnostics.tail()
         let ts = Diagnostics.timestamp()
-        let s = await MainActor.run { Diagnostics.deviceSummary() }
-
+        let dev = await MainActor.run { Diagnostics.deviceSummary() }
         var report = """
         ==== PhotoRevive3D Diagnostics ====
         Time: \(ts)
-        \(s)
+        \(dev)
         Last run crashed: \(Diagnostics.didCrashLastLaunch ? "YES" : "NO")
         ===================================
 

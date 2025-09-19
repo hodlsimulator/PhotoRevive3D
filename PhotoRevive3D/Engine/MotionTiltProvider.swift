@@ -29,7 +29,6 @@ final class MotionTiltProvider: ObservableObject {
 
     func start() {
         Diagnostics.log(.info, "Gyro start requested (available=\(mgr.isDeviceMotionAvailable))", category: "gyro")
-
         guard mgr.isDeviceMotionAvailable else {
             Diagnostics.log(.warn, "Device motion not available on this device/simulator", category: "gyro")
             return
@@ -62,10 +61,10 @@ final class MotionTiltProvider: ObservableObject {
 
                 if !self.didLogFirstSample {
                     self.didLogFirstSample = true
+                    let f3 = FloatingPointFormatStyle<Double>.number.precision(.fractionLength(3))
                     Diagnostics.log(
                         .info,
-                        String(format: "First sample: yaw=%.3f pitch=%.3f (raw yaw=%.3f pitch=%.3f)",
-                               yawNorm, pitchNorm, m.attitude.yaw, m.attitude.pitch),
+                        "First sample: yaw=\(yawNorm.formatted(f3)) pitch=\(pitchNorm.formatted(f3)) (raw yaw=\(m.attitude.yaw.formatted(f3)) pitch=\(m.attitude.pitch.formatted(f3)))",
                         category: "gyro"
                     )
                 }
