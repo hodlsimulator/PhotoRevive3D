@@ -4,8 +4,8 @@
 //
 //  Created by . . on 19/09/2025.
 //
-//  Robust MetricKit subscriber that writes opaque JSON payloads to disk.
-//  No table parsing; no Codable structs. Avoids crashes when Apple changes keys.
+//  Robust MetricKit subscriber. Saves raw JSON payloads (no strict decoding).
+//  Avoids UI/table crashes caused by shape drift across iOS versions.
 //
 
 import Foundation
@@ -29,40 +29,35 @@ final class MetricsSubscriber: NSObject, MXMetricManagerSubscriber {
         Diagnostics.log(.info, "MetricKit subscriber stopped", category: "metrics")
     }
 
-    // MARK: MXMetricManagerSubscriber
+    // MARK: - MXMetricManagerSubscriber
 
+    // Daily/periodic metrics
     func didReceive(_ payloads: [MXMetricPayload]) {
         guard !payloads.isEmpty else { return }
         let dir = Diagnostics.diagnosticsDir
+        let formatter = ISO8601DateFormatter()
         for p in payloads {
-            let data = p.jsonRepresentation() // non-optional Data
-            let filename = "MX-\(safeTimestamp()).json"
-            let url = dir.appendingPathComponent(filename)
+            let data = p.jsonRepresentation() // Data (non-optional)
+            let tsRaw = formatter.string(from: Date())
+            let ts = tsRaw.replacingOccurrences(of: ":", with: "-").replacingOccurrences(of: ".", with: "-")
+            let url = dir.appendingPathComponent("MX-\(ts).json")
             do { try data.write(to: url, options: .atomic) } catch {}
         }
         Diagnostics.log(.info, "Saved \(payloads.count) MXMetricPayload JSON file(s)", category: "metrics")
     }
 
+    // Crash/hang/CPU diagnostics
     func didReceive(_ payloads: [MXDiagnosticPayload]) {
         guard !payloads.isEmpty else { return }
         let dir = Diagnostics.diagnosticsDir
+        let formatter = ISO8601DateFormatter()
         for p in payloads {
-            let data = p.jsonRepresentation() // non-optional Data
-            let filename = "MXDiag-\(safeTimestamp()).json"
-            let url = dir.appendingPathComponent(filename)
+            let data = p.jsonRepresentation() // Data (non-optional)
+            let tsRaw = formatter.string(from: Date())
+            let ts = tsRaw.replacingOccurrences(of: ":", with: "-").replacingOccurrences(of: ".", with: "-")
+            let url = dir.appendingPathComponent("MXDiag-\(ts).json")
             do { try data.write(to: url, options: .atomic) } catch {}
         }
         Diagnostics.log(.error, "Received \(payloads.count) diagnostic payload(s) — saved as JSON", category: "metrics")
-    }
-
-    // MARK: helpers
-
-    private func safeTimestamp() -> String {
-        let raw = ISO8601DateFormatter().string(from: Date())
-        // Make FS-safe
-        return raw
-            .replacingOccurrences(of: ":", with: "-")
-            .replacingOccurrences(of: ".", with: "-")
-            .replacingOccurrences(of: "/", with: "-")
     }
 }

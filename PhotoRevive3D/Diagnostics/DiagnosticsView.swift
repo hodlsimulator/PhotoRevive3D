@@ -29,102 +29,99 @@ struct DiagnosticsView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     Spacer(minLength: 68) // room for top bar
+
                     // Summary card
-                    GlassCard {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Diagnostics")
-                                .font(.largeTitle).fontWeight(.semibold)
-                            Text(Diagnostics.deviceSummary)
-                                .font(.body).foregroundStyle(.secondary)
-                            HStack(spacing: 12) {
-                                Label(Diagnostics.didCrashLastLaunch ? "Previous launch crashed" : "Previous launch clean",
-                                      systemImage: Diagnostics.didCrashLastLaunch ? "exclamationmark.triangle" : "checkmark.seal")
-                                    .labelStyle(.titleAndIcon)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Diagnostics")
+                            .font(.largeTitle).fontWeight(.semibold)
+                        Text(Diagnostics.deviceSummary)
+                            .font(.body).foregroundStyle(.secondary)
+                        HStack(spacing: 12) {
+                            Label(Diagnostics.didCrashLastLaunch ? "Previous launch crashed" : "Previous launch clean",
+                                  systemImage: Diagnostics.didCrashLastLaunch ? "exclamationmark.triangle" : "checkmark.seal")
+                                .labelStyle(.titleAndIcon)
+                                .font(.subheadline)
+                            if metricsOn {
+                                Label("MetricKit: ON", systemImage: "waveform.path.ecg")
                                     .font(.subheadline)
-                                if metricsOn {
-                                    Label("MetricKit: ON", systemImage: "waveform.path.ecg")
-                                        .font(.subheadline)
-                                } else {
-                                    Label("MetricKit: OFF", systemImage: "waveform.path.ecg")
-                                        .foregroundStyle(.secondary)
-                                        .font(.subheadline)
-                                }
-                            }.padding(.top, 4)
+                            } else {
+                                Label("MetricKit: OFF", systemImage: "waveform.path.ecg")
+                                    .foregroundStyle(.secondary)
+                                    .font(.subheadline)
+                            }
                         }
+                        .padding(.top, 4)
                     }
+                    .glassCard()
 
                     // Crash summary + JSON viewer
                     if let crashSummary {
-                        GlassCard {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Latest Diagnostic")
-                                    .font(.headline)
-                                Text(crashSummary)
-                                    .font(.subheadline)
-                                Button {
-                                    latestJSON = Diagnostics.lastCrashJSON ?? "(no MetricKit JSON yet)"
-                                    showingJSON = true
-                                } label: {
-                                    Label("View JSON", systemImage: "doc.text.magnifyingglass")
-                                }
-                                .buttonStyle(.bordered)
-                                .padding(.top, 4)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Latest Diagnostic")
+                                .font(.headline)
+                            Text(crashSummary)
+                                .font(.subheadline)
+                            Button {
+                                latestJSON = Diagnostics.lastCrashJSON ?? "(no MetricKit JSON yet)"
+                                showingJSON = true
+                            } label: {
+                                Label("View JSON", systemImage: "doc.text.magnifyingglass")
                             }
+                            .buttonStyle(.bordered)
+                            .padding(.top, 4)
                         }
+                        .glassCard()
                     }
 
                     // MetricKit controls
-                    GlassCard {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("MetricKit")
-                                .font(.headline)
-                            Text("Start/stop collection on demand. Payloads save as JSON and never go through a brittle table.")
-                                .font(.footnote).foregroundStyle(.secondary)
-                            HStack {
-                                Button {
-                                    MetricsSubscriber.shared.start()
-                                    metricsOn = true
-                                } label: { Label("Start", systemImage: "play.fill") }
-                                .buttonStyle(.borderedProminent)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("MetricKit")
+                            .font(.headline)
+                        Text("Start/stop collection on demand. Payloads save as JSON and never go through a brittle table.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                        HStack {
+                            Button {
+                                MetricsSubscriber.shared.start()
+                                metricsOn = true
+                            } label: { Label("Start", systemImage: "play.fill") }
+                            .buttonStyle(.borderedProminent)
 
-                                Button {
-                                    MetricsSubscriber.shared.stop()
-                                    metricsOn = false
-                                } label: { Label("Stop", systemImage: "stop.fill") }
-                                .buttonStyle(.bordered)
-                            }
+                            Button {
+                                MetricsSubscriber.shared.stop()
+                                metricsOn = false
+                            } label: { Label("Stop", systemImage: "stop.fill") }
+                            .buttonStyle(.bordered)
                         }
                     }
+                    .glassCard()
 
                     // Live log tail (text)
-                    GlassCard {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Log (text)")
-                                .font(.headline)
-                            ScrollView(.vertical) {
-                                Text(logTail.isEmpty ? "(no log yet)" : logTail)
-                                    .font(.system(.footnote, design: .monospaced))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .textSelection(.enabled)
-                            }
-                            .frame(minHeight: 160, maxHeight: 240)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Log (text)")
+                            .font(.headline)
+                        ScrollView(.vertical) {
+                            Text(logTail.isEmpty ? "(no log yet)" : logTail)
+                                .font(.system(.footnote, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
                         }
+                        .frame(minHeight: 160, maxHeight: 240)
                     }
+                    .glassCard()
 
                     // Live JSON log (tail)
-                    GlassCard {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Log (JSON)")
-                                .font(.headline)
-                            ScrollView(.vertical) {
-                                Text(jsonTail.isEmpty ? "(no JSON log yet)" : jsonTail)
-                                    .font(.system(.footnote, design: .monospaced))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .textSelection(.enabled)
-                            }
-                            .frame(minHeight: 160, maxHeight: 240)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Log (JSON)")
+                            .font(.headline)
+                        ScrollView(.vertical) {
+                            Text(jsonTail.isEmpty ? "(no JSON log yet)" : jsonTail)
+                                .font(.system(.footnote, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
                         }
+                        .frame(minHeight: 160, maxHeight: 240)
                     }
+                    .glassCard()
 
                     Spacer(minLength: 24)
                 }
@@ -134,9 +131,7 @@ struct DiagnosticsView: View {
 
             // Top glass bar
             GlassTopBar {
-                Button {
-                    dismiss()
-                } label: {
+                Button { dismiss() } label: {
                     Label("Close", systemImage: "xmark")
                 }
                 .buttonStyle(.bordered)
@@ -185,9 +180,8 @@ struct DiagnosticsView: View {
 
     @MainActor
     private func refresh() async {
-        // Pull fresh tails from the actor (large reads off the main thread)
-        logTail = await LogSink.shared.tailText(maxBytes: 64 * 1024)
-        jsonTail = await LogSink.shared.tailJSON(maxBytes: 64 * 1024)
+        logTail = await Diagnostics.tailTextAsync(maxBytes: 64 * 1024)
+        jsonTail = await Diagnostics.tailJSONAsync(maxBytes: 64 * 1024)
         crashSummary = Diagnostics.lastCrashSummary
     }
 }

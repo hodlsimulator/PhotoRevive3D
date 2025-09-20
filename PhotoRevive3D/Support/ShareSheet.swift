@@ -5,11 +5,13 @@
 //  Created by . . on 9/19/25.
 //
 //  UIKit share sheet wrapper (URLs, Strings, etc).
+//  Conforms to Identifiable so you can use `.sheet(item:)`.
 //
 
 import SwiftUI
 
-struct ShareSheet: UIViewControllerRepresentable {
+struct ShareSheet: UIViewControllerRepresentable, Identifiable {
+    let id = UUID()
     let items: [Any]
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
