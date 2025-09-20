@@ -2,12 +2,15 @@
 //  PhotoRevive3DApp.swift
 //  PhotoRevive3D
 //
+//  Wires diagnostics bootstrap + clean-exit marker.
+//  Presents your existing root view.
+//
 
 import SwiftUI
 
 @main
 struct PhotoRevive3DApp: App {
-    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.scenePhase) private var phase
 
     init() {
         Diagnostics.bootstrap()
@@ -17,12 +20,9 @@ struct PhotoRevive3DApp: App {
         WindowGroup {
             RootView()
         }
-        .onChange(of: scenePhase) { _, phase in
-            // Remove the crash marker on a clean background transition.
-            if phase == .background {
-                Diagnostics.markCleanExit()
-                Diagnostics.log(.info, "Scene moved to background; marking clean exit")
-            }
+        .onChange(of: phase) { _, newPhase in
+            if newPhase == .background { Diagnostics.markCleanExit() }
         }
     }
 }
+

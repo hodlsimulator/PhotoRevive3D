@@ -4,64 +4,65 @@
 //
 //  Created by . . on 19/09/2025.
 //
-//  inimal MetricKit subscriber that saves diagnostic payloads as JSON
-//  into Diagnostics.diagnosticsDir. Safe to include in Release builds.
+//  Robust MetricKit subscriber that writes opaque JSON payloads to disk.
+//  No table parsing; no Codable structs. Avoids crashes when Apple changes keys.
 //
 
 import Foundation
-
-#if canImport(MetricKit)
 import MetricKit
 
-@available(iOS 14.0, *)
 final class MetricsSubscriber: NSObject, MXMetricManagerSubscriber {
-
     static let shared = MetricsSubscriber()
+    private(set) var isStarted = false
 
     func start() {
+        guard !isStarted else { return }
         MXMetricManager.shared.add(self)
+        isStarted = true
         Diagnostics.log(.info, "MetricKit subscriber started (on demand)", category: "metrics")
     }
 
     func stop() {
+        guard isStarted else { return }
         MXMetricManager.shared.remove(self)
+        isStarted = false
         Diagnostics.log(.info, "MetricKit subscriber stopped", category: "metrics")
     }
 
-    // Diagnostic payloads (crash, hang, etc.)
-    // Keep lightweight and non-UI; avoid @MainActor here.
-    func didReceive(_ payloads: [MXDiagnosticPayload]) {
-        let dir = Diagnostics.diagnosticsDir
-        var saved = 0
+    // MARK: MXMetricManagerSubscriber
 
-        for (idx, payload) in payloads.enumerated() {
-            let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
-            let stamp = f.string(from: Date())
-            let url = dir.appendingPathComponent("MXDiag-\(stamp)-\(idx).json")
-
-            let dict = payload.dictionaryRepresentation()
-            if JSONSerialization.isValidJSONObject(dict),
-               let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
-                do { try data.write(to: url, options: .atomic); saved += 1 } catch { }
-            } else if let data = String(describing: dict).data(using: .utf8) {
-                try? data.write(to: url, options: .atomic)
-                saved += 1
-            }
-        }
-
-        Diagnostics.log(.info, "MetricKit: saved \(saved)/\(payloads.count) diagnostic payload(s)", category: "metrics")
-    }
-
-    // Metric payloads (not persisted here)
     func didReceive(_ payloads: [MXMetricPayload]) {
-        Diagnostics.log(.info, "MetricKit: received \(payloads.count) metric payload(s)", category: "metrics")
+        guard !payloads.isEmpty else { return }
+        let dir = Diagnostics.diagnosticsDir
+        for p in payloads {
+            let data = p.jsonRepresentation() // non-optional Data
+            let filename = "MX-\(safeTimestamp()).json"
+            let url = dir.appendingPathComponent(filename)
+            do { try data.write(to: url, options: .atomic) } catch {}
+        }
+        Diagnostics.log(.info, "Saved \(payloads.count) MXMetricPayload JSON file(s)", category: "metrics")
+    }
+
+    func didReceive(_ payloads: [MXDiagnosticPayload]) {
+        guard !payloads.isEmpty else { return }
+        let dir = Diagnostics.diagnosticsDir
+        for p in payloads {
+            let data = p.jsonRepresentation() // non-optional Data
+            let filename = "MXDiag-\(safeTimestamp()).json"
+            let url = dir.appendingPathComponent(filename)
+            do { try data.write(to: url, options: .atomic) } catch {}
+        }
+        Diagnostics.log(.error, "Received \(payloads.count) diagnostic payload(s) — saved as JSON", category: "metrics")
+    }
+
+    // MARK: helpers
+
+    private func safeTimestamp() -> String {
+        let raw = ISO8601DateFormatter().string(from: Date())
+        // Make FS-safe
+        return raw
+            .replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: ".", with: "-")
+            .replacingOccurrences(of: "/", with: "-")
     }
 }
-
-#else
-final class MetricsSubscriber {
-    static let shared = MetricsSubscriber()
-    func start() {}
-    func stop() {}
-}
-#endif

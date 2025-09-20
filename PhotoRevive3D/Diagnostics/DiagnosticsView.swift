@@ -4,279 +4,206 @@
 //
 //  Created by . . on 19/09/2025.
 //
-//  Actor-safe diagnostics UI (sheet-friendly, no nav bar):
-//  • Rich hardware/system summary (screen, RAM, storage, locale, TZ, power, thermal).
-//  • Crash summary + JSON viewer (MetricKit payloads saved on demand).
-//  • Live tail of the rolling app log.
-//  • Bottom action bar (Refresh / Clear / Share / Enable MetricKit).
+//  iOS 26 "glass" redesign, no bottom nav. Top bar with Close / Share / Refresh / Clear.
+//  Includes hardware summary, crash summary, live log tail, and MetricKit controls.
+//  Safe JSON viewer (no table parsing).
 //
 
 import SwiftUI
-import UIKit
+import MetricKit
 
-@MainActor
 struct DiagnosticsView: View {
-    @Environment(\.displayScale) private var envDisplayScale
+    @Environment(\.dismiss) private var dismiss
 
     @State private var logTail: String = ""
-    @State private var jsonFiles: [URL] = []
-    @State private var selectedJSONText: String?
-    @State private var showJSONSheet = false
-    @State private var shareSheet: ShareSheet?
-    @State private var metricKitEnabled = false
+    @State private var jsonTail: String = ""
+    @State private var crashSummary: String? = Diagnostics.lastCrashSummary
+    @State private var showingShare = false
+    @State private var shareItems: [Any] = []
+    @State private var showingJSON = false
+    @State private var latestJSON: String = Diagnostics.lastCrashJSON ?? "(no MetricKit JSON yet)"
+    @State private var metricsOn: Bool = false
 
     var body: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-
-                    // SUMMARY
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Summary").font(.subheadline.weight(.semibold))
-                            summaryText
-                                .font(.system(.footnote, design: .monospaced))
-                                .textSelection(.enabled)
-                        }
-                    }
-
-                    // CRASH / JSON
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Crash & Diagnostic JSON").font(.subheadline.weight(.semibold))
-
-                            HStack(spacing: 8) {
-                                Circle().fill(Diagnostics.didCrashLastLaunch ? .red : .green)
-                                    .frame(width: 8, height: 8)
-                                Text("Last launch crashed: \(Diagnostics.didCrashLastLaunch ? "YES" : "NO")")
-                            }
-
-                            if let summary = Diagnostics.lastCrashSummary {
-                                Text("Last crash: \(summary)").font(.footnote)
-                            } else {
-                                Text("No parsed crash summary found.")
-                                    .font(.footnote).foregroundStyle(.secondary)
-                            }
-
-                            if !jsonFiles.isEmpty {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text("Diagnostic JSON files (\(jsonFiles.count)):")
-                                        .font(.footnote.weight(.semibold))
-                                    ForEach(jsonFiles.prefix(10), id: \.self) { url in
-                                        HStack {
-                                            Text(url.lastPathComponent)
-                                                .font(.footnote)
-                                                .lineLimit(1)
-                                                .truncationMode(.middle)
-                                            Spacer()
-                                            Button {
-                                                if let txt = try? String(contentsOf: url, encoding: .utf8) {
-                                                    selectedJSONText = txt
-                                                    showJSONSheet = true
-                                                }
-                                            } label: {
-                                                Label("View", systemImage: "doc.text.magnifyingglass")
-                                            }
-                                            .buttonStyle(.bordered)
-                                        }
-                                    }
-                                    if jsonFiles.count > 10 {
-                                        Text("…and \(jsonFiles.count - 10) more").font(.footnote).foregroundStyle(.secondary)
-                                    }
+                VStack(spacing: 16) {
+                    Spacer(minLength: 68) // room for top bar
+                    // Summary card
+                    GlassCard {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Diagnostics")
+                                .font(.largeTitle).fontWeight(.semibold)
+                            Text(Diagnostics.deviceSummary)
+                                .font(.body).foregroundStyle(.secondary)
+                            HStack(spacing: 12) {
+                                Label(Diagnostics.didCrashLastLaunch ? "Previous launch crashed" : "Previous launch clean",
+                                      systemImage: Diagnostics.didCrashLastLaunch ? "exclamationmark.triangle" : "checkmark.seal")
+                                    .labelStyle(.titleAndIcon)
+                                    .font(.subheadline)
+                                if metricsOn {
+                                    Label("MetricKit: ON", systemImage: "waveform.path.ecg")
+                                        .font(.subheadline)
+                                } else {
+                                    Label("MetricKit: OFF", systemImage: "waveform.path.ecg")
+                                        .foregroundStyle(.secondary)
+                                        .font(.subheadline)
                                 }
-                            } else {
-                                Text("No MetricKit JSON payloads yet. Enable MetricKit below, then reproduce the issue; payloads appear here.")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
+                            }.padding(.top, 4)
+                        }
+                    }
+
+                    // Crash summary + JSON viewer
+                    if let crashSummary {
+                        GlassCard {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Latest Diagnostic")
+                                    .font(.headline)
+                                Text(crashSummary)
+                                    .font(.subheadline)
+                                Button {
+                                    latestJSON = Diagnostics.lastCrashJSON ?? "(no MetricKit JSON yet)"
+                                    showingJSON = true
+                                } label: {
+                                    Label("View JSON", systemImage: "doc.text.magnifyingglass")
+                                }
+                                .buttonStyle(.bordered)
+                                .padding(.top, 4)
                             }
                         }
                     }
 
-                    // LOG TAIL
-                    GroupBox {
+                    // MetricKit controls
+                    GlassCard {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("MetricKit")
+                                .font(.headline)
+                            Text("Start/stop collection on demand. Payloads save as JSON and never go through a brittle table.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            HStack {
+                                Button {
+                                    MetricsSubscriber.shared.start()
+                                    metricsOn = true
+                                } label: { Label("Start", systemImage: "play.fill") }
+                                .buttonStyle(.borderedProminent)
+
+                                Button {
+                                    MetricsSubscriber.shared.stop()
+                                    metricsOn = false
+                                } label: { Label("Stop", systemImage: "stop.fill") }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                    }
+
+                    // Live log tail (text)
+                    GlassCard {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Log tail").font(.subheadline.weight(.semibold))
-                            TextEditor(text: $logTail)
-                                .font(.system(.footnote, design: .monospaced))
-                                .frame(minHeight: 280)
-                                .scrollContentBackground(.hidden)
-                                .background(Color(.secondarySystemBackground))
-                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            Text("Log (text)")
+                                .font(.headline)
+                            ScrollView(.vertical) {
+                                Text(logTail.isEmpty ? "(no log yet)" : logTail)
+                                    .font(.system(.footnote, design: .monospaced))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(minHeight: 160, maxHeight: 240)
                         }
                     }
 
-                    // Spacer to avoid being covered by the bottom bar
-                    Color.clear.frame(height: 80)
+                    // Live JSON log (tail)
+                    GlassCard {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Log (JSON)")
+                                .font(.headline)
+                            ScrollView(.vertical) {
+                                Text(jsonTail.isEmpty ? "(no JSON log yet)" : jsonTail)
+                                    .font(.system(.footnote, design: .monospaced))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(minHeight: 160, maxHeight: 240)
+                        }
+                    }
+
+                    Spacer(minLength: 24)
                 }
-                .padding()
+                .padding(.horizontal, 16)
+                .padding(.bottom, 24)
             }
 
-            // Bottom action bar (sheet-friendly; no nav bar)
-            VStack {
+            // Top glass bar
+            GlassTopBar {
+                Button {
+                    dismiss()
+                } label: {
+                    Label("Close", systemImage: "xmark")
+                }
+                .buttonStyle(.bordered)
+
                 Spacer()
-                HStack(spacing: 10) {
-                    Button {
-                        refreshAll()
-                    } label: {
-                        Label("Refresh", systemImage: "arrow.clockwise")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
 
-                    Button {
-                        Task { await Diagnostics.clearAll(); refreshAll() }
-                    } label: {
-                        Label("Clear", systemImage: "trash")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-
-                    Button {
-                        Task {
-                            let urls = await Diagnostics.collectShareURLs()
-                            shareSheet = ShareSheet(items: urls)
-                        }
-                    } label: {
-                        Label("Share Logs", systemImage: "square.and.arrow.up")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
+                Button {
+                    Task { await refresh() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
                 }
-                .padding(.horizontal).padding(.top, 8)
+                .buttonStyle(.bordered)
 
-                // Optional: enable MetricKit on-demand (safe; not at launch)
-                HStack {
-                    Button {
-                        enableMetricKit()
-                    } label: {
-                        Label(metricKitEnabled ? "MetricKit Enabled" : "Enable MetricKit", systemImage: "bolt.badge.a")
-                            .frame(maxWidth: .infinity)
+                Button(role: .destructive) {
+                    Task {
+                        await Diagnostics.clearAll()
+                        await refresh()
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(metricKitEnabled)
+                } label: {
+                    Label("Clear", systemImage: "trash")
                 }
-                .padding(.horizontal)
-                .padding(.bottom, 10)
-                .background(.ultraThinMaterial)
+                .buttonStyle(.bordered)
+
+                Button {
+                    Task {
+                        shareItems = await Diagnostics.collectShareURLs()
+                        showingShare = true
+                    }
+                } label: {
+                    Label("Share", systemImage: "square.and.arrow.up") // shortened label
+                }
+                .buttonStyle(.borderedProminent)
             }
         }
-        .sheet(item: $shareSheet) { sheet in sheet }
-        .sheet(isPresented: $showJSONSheet) {
-            // Simple JSON viewer sheet (monospaced)
+        .background(.thickMaterial.opacity(0.05))
+        .onAppear {
+            Task { await refresh() }
+        }
+        .sheet(isPresented: $showingShare) {
+            ShareSheet(items: shareItems)
+        }
+        .sheet(isPresented: $showingJSON) {
+            JSONViewer(json: latestJSON)
+        }
+    }
+
+    @MainActor
+    private func refresh() async {
+        // Pull fresh tails from the actor (large reads off the main thread)
+        logTail = await LogSink.shared.tailText(maxBytes: 64 * 1024)
+        jsonTail = await LogSink.shared.tailJSON(maxBytes: 64 * 1024)
+        crashSummary = Diagnostics.lastCrashSummary
+    }
+}
+
+// Simple JSON viewer (avoids tables entirely)
+private struct JSONViewer: View {
+    let json: String
+    var body: some View {
+        NavigationStack {
             ScrollView {
-                Text(selectedJSONText ?? "(no data)")
+                Text(json.isEmpty ? "(empty JSON)" : json)
                     .font(.system(.footnote, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding()
+                    .textSelection(.enabled)
             }
-            .presentationDetents([.medium, .large])
-        }
-        .onAppear { refreshAll() }
-    }
-
-    private func refreshAll() {
-        logTail = Diagnostics.tail(maxBytes: 128_000)           // safe (no underflow)
-        jsonFiles = loadJSONFiles()
-    }
-
-    private func enableMetricKit() {
-        // Start subscriber on demand; safe (we intentionally skip doing this at launch).
-        #if canImport(MetricKit)
-        if #available(iOS 14.0, *) {
-            MetricsSubscriber.shared.start()
-            metricKitEnabled = true
-            // Refresh soon after enabling; payloads arrive asynchronously.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { refreshAll() }
-        }
-        #endif
-    }
-
-    // Build a richer hardware/system summary (monospaced) without UIScreen.main
-    private var summaryText: Text {
-        let screen = activeScreen()
-        let native = screen?.nativeBounds ?? .zero
-        let scale = screen?.scale ?? envDisplayScale
-        let points = screen?.coordinateSpace.bounds.size ?? .zero
-
-        let d = UIDevice.current
-        let locale = Locale.current.identifier
-        let tz = TimeZone.current.identifier
-        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled ? "ON" : "OFF"
-        let thermal: String = {
-            switch ProcessInfo.processInfo.thermalState {
-            case .nominal: return "nominal"
-            case .fair:    return "fair"
-            case .serious: return "serious"
-            case .critical:return "critical"
-            @unknown default: return "unknown"
-            }
-        }()
-
-        let ram = ByteCountFormatter.string(fromByteCount: Int64(ProcessInfo.processInfo.physicalMemory),
-                                            countStyle: .binary)
-        let (diskFree, diskTotal) = storageTuple()
-        let uptime = String(format: "%.0fs", ProcessInfo.processInfo.systemUptime)
-
-        let screenLine: String = {
-            if native == .zero || points == .zero {
-                return String(format: "Screen: (unavailable) @%.2fx", scale)
-            } else {
-                return String(format: "Screen: %.0fx%.0fpt (native: %.0fx%.0f) @%.2fx",
-                              points.width, points.height, native.width, native.height, scale)
-            }
-        }()
-
-        let lines: [String] = [
-            "Device: \(d.model)",
-            "OS: \(d.systemName) \(d.systemVersion)",
-            screenLine,
-            "Locale: \(locale)   Timezone: \(tz)",
-            "Low Power: \(lowPower)   Thermal: \(thermal)",
-            "RAM: \(ram)",
-            "Storage: \(diskFree) free / \(diskTotal) total",
-            "Uptime: \(uptime)"
-        ]
-
-        return Text(lines.joined(separator: "\n"))
-    }
-
-    // Get the UIScreen for the current foreground scene (no UIScreen.main)
-    private func activeScreen() -> UIScreen? {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        if let active = scenes.first(where: { $0.activationState == .foregroundActive }) {
-            return active.screen
-        }
-        return scenes.first?.screen
-    }
-
-    // Synchronous list of JSON files (latest first)
-    private func loadJSONFiles() -> [URL] {
-        let dir = Diagnostics.diagnosticsDir
-        let fm = FileManager.default
-        let items = (try? fm.contentsOfDirectory(at: dir,
-                                                 includingPropertiesForKeys: [.contentModificationDateKey],
-                                                 options: [.skipsHiddenFiles])) ?? []
-        let jsons = items.filter { $0.pathExtension.lowercased() == "json" }
-        return jsons.sorted { a, b in
-            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return da > db
-        }
-    }
-
-    // Human-friendly disk space summary
-    private func storageTuple() -> (free: String, total: String) {
-        do {
-            let attrs = try FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory())
-            let free = (attrs[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
-            let total = (attrs[.systemSize] as? NSNumber)?.int64Value ?? 0
-            let fmt = ByteCountFormatter()
-            fmt.allowedUnits = [.useGB, .useMB]
-            fmt.countStyle = .decimal
-            return (fmt.string(fromByteCount: free), fmt.string(fromByteCount: total))
-        } catch {
-            return ("n/a", "n/a")
+            .navigationTitle("MetricKit JSON")
         }
     }
 }

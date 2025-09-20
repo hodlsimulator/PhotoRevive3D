@@ -4,16 +4,18 @@
 //
 //  Created by . . on 9/19/25.
 //
+//  UIKit share sheet wrapper (URLs, Strings, etc).
+//
 
 import SwiftUI
-import UIKit
 
-struct ShareSheet: UIViewControllerRepresentable, Identifiable {
-    let id = UUID()
+struct ShareSheet: UIViewControllerRepresentable {
     let items: [Any]
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
+        let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        vc.excludedActivityTypes = [.assignToContact, .addToReadingList, .print]
+        return vc
     }
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}

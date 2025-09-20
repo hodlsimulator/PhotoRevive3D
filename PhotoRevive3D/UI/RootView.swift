@@ -4,6 +4,8 @@
 //
 //  Created by . . on 19/09/2025.
 //
+//  Minimal host that can present Diagnostics without a bottom nav bar.
+//
 
 import SwiftUI
 
@@ -11,25 +13,16 @@ struct RootView: View {
     @State private var showDiagnostics = false
 
     var body: some View {
-        NavigationStack {
-            ContentView()
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Menu {
-                            Button {
-                                showDiagnostics = true
-                            } label: {
-                                Label("Diagnostics", systemImage: "wrench.and.screwdriver")
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis.circle")
-                        }
-                    }
+        ContentView()
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showDiagnostics = true
+                    } label: { Image(systemName: "wrench.and.screwdriver") }
                 }
-        }
-        .sheet(isPresented: $showDiagnostics) {
-            DiagnosticsView()
-        }
+            }
+            .sheet(isPresented: $showDiagnostics) {
+                DiagnosticsView()
+            }
     }
 }
