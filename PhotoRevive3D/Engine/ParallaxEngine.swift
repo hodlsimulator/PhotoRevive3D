@@ -13,15 +13,22 @@ import UIKit
 /// Renders a 2-layer parallax (background vs subject) using the depth/mask.
 /// Full-res for export; screen-scaled pipeline for live preview.
 final class ParallaxEngine {
+
     private(set) var originalCI: CIImage
     private(set) var depthCI: CIImage!
     private(set) var personMaskCI: CIImage?
 
     /// CIContext for both preview + export (keep caches low to avoid spikes).
-    private let ciContext = CIContext(options: [
-        .useSoftwareRenderer: false,
-        .cacheIntermediates: false
-    ])
+    private let ciContext: CIContext = {
+        let linear = CGColorSpace(name: CGColorSpace.linearSRGB)!
+        let outCS = CGColorSpace(name: CGColorSpace.sRGB)!
+        return CIContext(options: [
+            .useSoftwareRenderer: false,
+            .cacheIntermediates: false,
+            .workingColorSpace: linear,
+            .outputColorSpace: outCS
+        ])
+    }()
 
     // Full-resolution output (used by exporter)
     private(set) var outputSize: CGSize
@@ -33,7 +40,7 @@ final class ParallaxEngine {
     private var maskCI: CIImage!
 
     // Screen-scaled preview pipeline
-    private(set) var previewTargetLongest: CGFloat = 1600 // pixels; updated by updatePreviewLOD
+    private(set) var previewTargetLongest: CGFloat = 1600 // px; updated by updatePreviewLOD
     private var previewScale: CGFloat = 1
     private var previewSize: CGSize = .zero
     private var pBgCI: CIImage!
@@ -45,7 +52,8 @@ final class ParallaxEngine {
         } else if let ci = uiImage.ciImage {
             self.originalCI = ci
         } else {
-            self.originalCI = CIImage(color: .gray).cropped(to: CGRect(x: 0, y: 0, width: 512, height: 512))
+            self.originalCI = CIImage(color: .gray)
+                .cropped(to: CGRect(x: 0, y: 0, width: 512, height: 512))
         }
         self.outputSize = originalCI.extent.size
     }
@@ -122,7 +130,7 @@ final class ParallaxEngine {
                                            yaw: CGFloat,
                                            pitch: CGFloat,
                                            intensity: CGFloat) -> CIImage {
-        let maxShift = min(snap.size.width, snap.size.height) * 0.02 * intensity // ≈2% of min dimension
+        let maxShift = min(snap.size.width, snap.size.height) * 0.02 * intensity // ≈2%
         let bgTx = yaw * maxShift
         let bgTy = pitch * maxShift
         let fgTx = -yaw * maxShift * 0.65
@@ -169,17 +177,15 @@ final class ParallaxEngine {
     private func rebuildPreviewLayers(targetLongestPx: CGFloat) {
         let longEdge = max(outputSize.width, outputSize.height)
         let newScale = min(1, targetLongestPx / longEdge)
-
-        if abs(newScale - previewScale) < 0.04, pBgCI != nil, pFgCI != nil {
-            return
-        }
+        if abs(newScale - previewScale) < 0.04, pBgCI != nil, pFgCI != nil { return }
 
         previewScale = newScale
+
         if previewScale < 1 {
             let pOriginal = lanczosScale(originalCI, scale: previewScale)
             let pMask = lanczosScale(maskCI, scale: previewScale)
-            let pTransparent = CIImage(color: .clear).cropped(to: pOriginal.extent)
 
+            let pTransparent = CIImage(color: .clear).cropped(to: pOriginal.extent)
             pFgCI = pOriginal.applyingFilter("CIBlendWithMask", parameters: [
                 kCIInputBackgroundImageKey: pTransparent,
                 kCIInputMaskImageKey: pMask

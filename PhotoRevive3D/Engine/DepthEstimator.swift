@@ -14,11 +14,12 @@ import UIKit
 /// Builds a synthetic depth map (0…1, white = near) from a single image using
 /// person segmentation when available, else a gentle radial fallback. Fully on-device.
 enum DepthEstimator {
+
     static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     struct Result {
-        let depthCI: CIImage            // grayscale 0…1
-        let personMaskCI: CIImage?      // optional 0…1
+        let depthCI: CIImage      // grayscale 0…1
+        let personMaskCI: CIImage?// optional 0…1
         let size: CGSize
     }
 
@@ -29,14 +30,20 @@ enum DepthEstimator {
         // Try person segmentation (best for portraits)
         let personMask = try? personSegmentationMask(cgImage: cg, targetSize: size)
 
-        // Compose depth: if we have a person mask, use it (blurred) as near; otherwise a soft radial near-centre map.
+        // Compose depth:
+        // If we have a person mask, close small holes (max→min), then a light blur.
+        // Otherwise, a soft radial near-centre map.
         let depth: CIImage
         if let personMask {
-            let blurred = personMask
+            let closed = personMask
+                .applyingFilter("CIMorphologyMaximum", parameters: [kCIInputRadiusKey: 1.0])
+                .applyingFilter("CIMorphologyMinimum", parameters: [kCIInputRadiusKey: 1.0])
                 .clampedToExtent()
-                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 6.0])
                 .cropped(to: CGRect(origin: .zero, size: size))
-            depth = blurred
+
+            depth = closed
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 3.0])
+                .cropped(to: CGRect(origin: .zero, size: size))
         } else {
             depth = radialNearMap(size: size)
         }
@@ -44,7 +51,7 @@ enum DepthEstimator {
         // Gentle smooth & clamp to 0…1
         let smoothed = depth
             .clampedToExtent()
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 4.0])
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 2.0])
             .cropped(to: CGRect(origin: .zero, size: size))
             .applyingFilter("CIColorClamp", parameters: [
                 "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
@@ -60,10 +67,10 @@ enum DepthEstimator {
         let request = VNGeneratePersonSegmentationRequest()
         request.qualityLevel = .accurate
         request.outputPixelFormat = kCVPixelFormatType_OneComponent8
-        // `usesCPUOnly` is deprecated; rely on default (hardware-accelerated) path.
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         try handler.perform([request])
+
         guard let obs = request.results?.first as? VNPixelBufferObservation else {
             throw EstimatorError.noPersonMask
         }
@@ -87,8 +94,7 @@ enum DepthEstimator {
     }
 
     enum EstimatorError: Error {
-        case noCGImage
-        case noPersonMask
+        case noCGImage, noPersonMask
     }
 }
 

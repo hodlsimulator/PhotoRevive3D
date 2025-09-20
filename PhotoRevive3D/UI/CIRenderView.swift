@@ -4,33 +4,39 @@
 //
 //  Created by . . on 9/19/25.
 //
-//  SwiftUI wrapper that renders CIImage frames directly into an MTKView.
-//  Uses a command buffer (no per-frame CGImage allocations).
-//
 
 import SwiftUI
 import MetalKit
 import CoreImage
+import UIKit
 
+/// SwiftUI wrapper that renders CIImage frames directly into an MTKView.
+/// Uses a command buffer (no per-frame CGImage allocations).
 struct CIRenderView: UIViewRepresentable {
     @Binding var image: CIImage?
 
     final class Coordinator: NSObject, MTKViewDelegate {
         private var ciContext: CIContext?
         private var commandQueue: MTLCommandQueue?
-        private let colorSpace = CGColorSpaceCreateDeviceRGB()
+        private let linearCS = CGColorSpace(name: CGColorSpace.linearSRGB)! // render in linear
+
         var currentImage: CIImage?
 
+        private func makeWorkingContext(device: MTLDevice) {
+            // Linear working space; no outputColorSpace, we pass linearCS at render time.
+            let opts: [CIContextOption: Any] = [
+                .workingColorSpace: linearCS,
+                .cacheIntermediates: false,
+                .useSoftwareRenderer: false
+            ]
+            self.ciContext = CIContext(mtlDevice: device, options: opts)
+        }
+
         private func ensureMetal(for view: MTKView) {
-            if view.device == nil {
-                view.device = MTLCreateSystemDefaultDevice()
-            }
-            if let dev = view.device {
-                if commandQueue == nil { commandQueue = dev.makeCommandQueue() }
-                if ciContext == nil {
-                    ciContext = CIContext(mtlDevice: dev, options: [.cacheIntermediates: false])
-                }
-            }
+            if view.device == nil { view.device = MTLCreateSystemDefaultDevice() }
+            guard let dev = view.device else { return }
+            if commandQueue == nil { commandQueue = dev.makeCommandQueue() }
+            if ciContext == nil { makeWorkingContext(device: dev) }
         }
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) { }
@@ -39,8 +45,7 @@ struct CIRenderView: UIViewRepresentable {
             guard let img = currentImage else { return }
             ensureMetal(for: view)
             guard
-                let ciContext = ciContext,
-                let commandQueue = commandQueue,
+                let ciContext, let commandQueue,
                 let drawable = view.currentDrawable
             else { return }
 
@@ -56,12 +61,14 @@ struct CIRenderView: UIViewRepresentable {
 
             autoreleasepool {
                 if let cb = commandQueue.makeCommandBuffer() {
+                    // IMPORTANT: render with a *linear* colour space into an sRGB framebuffer.
+                    // Hardware does the sRGB encode on store; no double-encode.
                     ciContext.render(
                         img,
                         to: drawable.texture,
                         commandBuffer: cb,
                         bounds: dest,
-                        colorSpace: colorSpace
+                        colorSpace: linearCS
                     )
                     cb.present(drawable)
                     cb.commit()
@@ -74,9 +81,12 @@ struct CIRenderView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> MTKView {
         let view = MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
-        view.isPaused = true                   // draw only when asked
+
+        // sRGB framebuffer; GPU encodes sRGB on write from linear inputs.
+        view.colorPixelFormat = .bgra8Unorm_srgb
+        view.isPaused = true                 // draw only when asked
         view.enableSetNeedsDisplay = true
-        view.framebufferOnly = false           // required for Core Image rendering
+        view.framebufferOnly = false         // required for Core Image rendering
         view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         view.delegate = context.coordinator
         return view

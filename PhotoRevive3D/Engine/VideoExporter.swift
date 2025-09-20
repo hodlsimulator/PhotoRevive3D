@@ -9,9 +9,9 @@ import Foundation
 import AVFoundation
 import CoreImage
 import UIKit
+import VideoToolbox
 
 enum VideoExporter {
-
     enum ExportError: Error {
         case noPixelBufferPool
         case pixelBufferCreationFailed
@@ -44,19 +44,56 @@ enum VideoExporter {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("PhotoRevive3D-\(UUID().uuidString).mp4")
 
-        // Writer + input
+        // Writer + input (prefer HEVC; fallback to H.264)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        let compression: [String: Any] = [
-            AVVideoAverageBitRateKey: max(4_000_000, w * h * 4) // ~4 Mbps or scale with pixels
+
+        // Bitrate: scale with pixels; clamp sensible floor/ceiling.
+        // ~0.12 bits/pixel @ 60 fps for HEVC; H.264 will still look good.
+        let bpp: Double = 0.12
+        let targetBitrate = Int(Double(w * h * fps) * bpp)
+        let bitrate = max(12_000_000, min(targetBitrate, 80_000_000))
+
+        let colorProps: [String: Any] = [
+            AVVideoColorPrimariesKey: AVVideoColorPrimaries_P3_D65,
+            AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+            AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
         ]
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
+
+        // Try HEVC first
+        var videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: w,
             AVVideoHeightKey: h,
-            AVVideoCompressionPropertiesKey: compression
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: bitrate,
+                AVVideoExpectedSourceFrameRateKey: fps,
+                AVVideoAllowFrameReorderingKey: false,
+                AVVideoMaxKeyFrameIntervalKey: fps
+            ],
+            AVVideoColorPropertiesKey: colorProps
         ]
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+
+        var input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         input.expectsMediaDataInRealTime = false
+
+        if writer.canAdd(input) == false {
+            // Fallback to H.264
+            videoSettings = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: w,
+                AVVideoHeightKey: h,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: bitrate,
+                    AVVideoExpectedSourceFrameRateKey: fps,
+                    AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,
+                    AVVideoAllowFrameReorderingKey: false,
+                    AVVideoMaxKeyFrameIntervalKey: fps
+                ],
+                AVVideoColorPropertiesKey: colorProps
+            ]
+            input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            input.expectsMediaDataInRealTime = false
+        }
 
         precondition(writer.canAdd(input))
         writer.add(input)
@@ -67,7 +104,9 @@ enum VideoExporter {
             kCVPixelBufferWidthKey as String: w,
             kCVPixelBufferHeightKey as String: h,
             kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
-            kCVPixelBufferCGImageCompatibilityKey as String: true
+            kCVPixelBufferCGImageCompatibilityKey as String: true,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
         ]
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: input,
@@ -91,14 +130,9 @@ enum VideoExporter {
         // Render loop — smooth ellipse over [0,1].
         do {
             for i in 0..<totalFrames {
-                try Task.checkCancellation()
+                if Task.isCancelled { throw CancellationError() }
 
-                while !input.isReadyForMoreMediaData {
-                    try await Task.sleep(nanoseconds: 1_000_000) // 1 ms
-                    try Task.checkCancellation()
-                }
-
-                let tRaw = totalFrames > 1 ? Double(i) / Double(totalFrames - 1) : 0
+                let tRaw = (totalFrames > 1) ? Double(i) / Double(totalFrames - 1) : 0
                 let t = options.curve.apply(tRaw)
 
                 // Elliptical loop; values in [-1, 1].
@@ -119,7 +153,12 @@ enum VideoExporter {
                 // Render CI → PixelBuffer
                 Self.ciContext.render(ci, to: pxbuf)
 
+                // Append
                 let time = CMTimeMultiply(frameDuration, multiplier: Int32(frameCount))
+                while input.isReadyForMoreMediaData == false {
+                    // Backpressure
+                    try await Task.sleep(nanoseconds: 1_000_000) // 1 ms
+                }
                 adaptor.append(pxbuf, withPresentationTime: time)
                 frameCount += 1
 
@@ -144,9 +183,7 @@ enum VideoExporter {
         // Finish writing on the main actor; don't touch `writer` inside the @Sendable completion.
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             Task { @MainActor in
-                writer.finishWriting {
-                    cont.resume(returning: ())
-                }
+                writer.finishWriting { cont.resume() }
             }
         }
 
