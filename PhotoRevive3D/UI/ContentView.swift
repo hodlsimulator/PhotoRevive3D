@@ -13,8 +13,8 @@ import CoreImage
 import UIKit
 
 struct ContentView: View {
-    @Environment(\.displayScale) private var displayScale
 
+    @Environment(\.displayScale) private var displayScale
     @State private var pickerItem: PhotosPickerItem?
     @State private var engine: ParallaxEngine?
 
@@ -82,6 +82,7 @@ struct ContentView: View {
                 if useMotion {
                     Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
                     motion.start()
+                    motion.calibrateZero()      // <-- auto-centre on toggle
                     schedulePreview()
                 } else {
                     Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
@@ -96,9 +97,7 @@ struct ContentView: View {
         .onChange(of: intensity) { _, _ in schedulePreview() }
         .onChange(of: yaw) { _, _ in if !useMotion { schedulePreview() } }
         .onChange(of: pitch) { _, _ in if !useMotion { schedulePreview() } }
-        .onDisappear {
-            if useMotion { motion.stop() }
-        }
+        .onDisappear { if useMotion { motion.stop() } }
     }
 
     // MARK: - UI
@@ -139,9 +138,7 @@ struct ContentView: View {
             GeometryReader { geo in
                 Color.clear
                     .onAppear { updateLODFrom(size: geo.size) }
-                    .onChange(of: geo.size) { _, newSize in
-                        updateLODFrom(size: newSize)
-                    }
+                    .onChange(of: geo.size) { _, newSize in updateLODFrom(size: newSize) }
             }
         )
     }
@@ -150,16 +147,16 @@ struct ContentView: View {
         VStack(spacing: 12) {
             if engine != nil {
                 HStack {
-                    Toggle(isOn: $useMotion) {
-                        Label("Gyro", systemImage: "gyroscope")
-                    }
-                    .toggleStyle(.switch)
-
+                    Toggle(isOn: $useMotion) { Label("Gyro", systemImage: "gyroscope") }
+                        .toggleStyle(.switch)
                     Spacer()
-
                     Button {
-                        yaw = 0; pitch = 0
-                        Diagnostics.log(.debug, "Manual centre applied", category: "gyro")
+                        if useMotion {
+                            motion.calibrateZero()      // <-- centre when gyro is ON
+                        } else {
+                            yaw = 0; pitch = 0
+                        }
+                        Diagnostics.log(.debug, "Centre applied", category: "gyro")
                         schedulePreview()
                     } label: {
                         Label("Centre", systemImage: "scope")
@@ -297,7 +294,6 @@ struct ContentView: View {
         )
 
         Diagnostics.log(.info, "Export started (duration=\(exportSeconds)s, fps=\(exportFPS))", category: "export")
-
         exportTask = Task(priority: .userInitiated) {
             do {
                 let url = try await VideoExporter.exportParallaxVideo(
@@ -335,8 +331,11 @@ struct ContentView: View {
 
     private func currentParams() -> (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)? {
         guard engine != nil else { return nil }
-        if useMotion { return (CGFloat(motion.yaw), CGFloat(motion.pitch), intensity) }
-        else { return (yaw, pitch, intensity) }
+        if useMotion {
+            return (CGFloat(motion.yaw), CGFloat(motion.pitch), intensity)
+        } else {
+            return (yaw, pitch, intensity)
+        }
     }
 
     private func schedulePreview() {
@@ -345,7 +344,6 @@ struct ContentView: View {
             self.pendingParams = params
             guard !self.renderInFlight else { return }
             self.renderInFlight = true
-
             self.previewTask = Task.detached(priority: .userInitiated) {
                 var frames = 0
                 var loggedStart = false
@@ -357,7 +355,6 @@ struct ContentView: View {
                         self.pendingParams = nil
                         return (snap, next, lodPx)
                     }
-
                     guard let (snapshot, next, lodPx) = fetched else { break }
 
                     if !loggedStart {

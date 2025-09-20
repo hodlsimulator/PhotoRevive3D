@@ -4,14 +4,15 @@
 //
 //  Created by . . on 9/19/25.
 //
+//  Renders a 2-layer parallax (background vs subject) using the depth/mask.
+//  Full-res for export; screen-scaled pipeline for live preview.
+//
 
 import Foundation
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import UIKit
 
-/// Renders a 2-layer parallax (background vs subject) using the depth/mask.
-/// Full-res for export; screen-scaled pipeline for live preview.
 final class ParallaxEngine {
 
     private(set) var originalCI: CIImage
@@ -21,7 +22,7 @@ final class ParallaxEngine {
     /// CIContext for both preview + export (keep caches low to avoid spikes).
     private let ciContext: CIContext = {
         let linear = CGColorSpace(name: CGColorSpace.linearSRGB)!
-        let outCS = CGColorSpace(name: CGColorSpace.sRGB)!
+        let outCS  = CGColorSpace(name: CGColorSpace.sRGB)!
         return CIContext(options: [
             .useSoftwareRenderer: false,
             .cacheIntermediates: false,
@@ -84,14 +85,17 @@ final class ParallaxEngine {
             kCIInputMaskImageKey: maskCI as Any
         ])
 
-        // Background = image over transparent using inverted mask, slightly scaled to reduce edge gaps
+        // Background = image over transparent using inverted mask, slightly scaled to reduce edge gaps.
+        // Keep margin ~2% (half per side) so translations don’t show seams.
         let invMask = maskCI.applyingFilter("CIColorInvert")
-        let slightlyScaledBG = originalCI
-            .transformed(by: .init(scaleX: 1.03, y: 1.03))
-            .transformed(by: .init(translationX: -originalCI.extent.width * 0.015,
-                                   y: -originalCI.extent.height * 0.015))
+        let bgScale: CGFloat = 1.02
+        let dx = -(originalCI.extent.width  * (bgScale - 1) * 0.5)
+        let dy = -(originalCI.extent.height * (bgScale - 1) * 0.5)
+        let bgExpanded = originalCI
+            .transformed(by: .init(scaleX: bgScale, y: bgScale))
+            .transformed(by: .init(translationX: dx, y: dy))
             .cropped(to: originalCI.extent)
-        bgCI = slightlyScaledBG.applyingFilter("CIBlendWithMask", parameters: [
+        bgCI = bgExpanded.applyingFilter("CIBlendWithMask", parameters: [
             kCIInputBackgroundImageKey: transparent,
             kCIInputMaskImageKey: invMask
         ])
@@ -125,12 +129,10 @@ final class ParallaxEngine {
     }
 
     /// Pure function: compose a preview CIImage from a snapshot + params (off-main friendly).
-    /// Explicitly nonisolated so it can be called from background queues.
-    nonisolated static func composePreview(from snap: PreviewSnapshot,
-                                           yaw: CGFloat,
-                                           pitch: CGFloat,
-                                           intensity: CGFloat) -> CIImage {
-        let maxShift = min(snap.size.width, snap.size.height) * 0.02 * intensity // ≈2%
+    /// No per-frame scaling: only translations, so there’s no “zoom creep”.
+    nonisolated static func composePreview(from snap: PreviewSnapshot, yaw: CGFloat, pitch: CGFloat, intensity: CGFloat) -> CIImage {
+        // Allow up to ~2% travel (combined with 1.02 background margin).
+        let maxShift = min(snap.size.width, snap.size.height) * 0.02 * intensity
         let bgTx = yaw * maxShift
         let bgTy = pitch * maxShift
         let fgTx = -yaw * maxShift * 0.65
@@ -138,12 +140,9 @@ final class ParallaxEngine {
 
         let bg = snap.bg
             .transformed(by: .init(translationX: bgTx, y: bgTy))
-            .transformed(by: .init(scaleX: 1.01, y: 1.01))
             .cropped(to: snap.bg.extent)
-
         let fg = snap.fg
             .transformed(by: .init(translationX: fgTx, y: fgTy))
-            .transformed(by: .init(scaleX: 1.005, y: 1.005))
             .cropped(to: snap.fg.extent)
 
         return fg.applyingFilter("CISourceOverCompositing", parameters: [kCIInputBackgroundImageKey: bg])
@@ -160,12 +159,9 @@ final class ParallaxEngine {
 
         let bg = bgCI
             .transformed(by: .init(translationX: bgTx, y: bgTy))
-            .transformed(by: .init(scaleX: 1.01, y: 1.01))
             .cropped(to: originalCI.extent)
-
         let fg = fgCI
             .transformed(by: .init(translationX: fgTx, y: fgTy))
-            .transformed(by: .init(scaleX: 1.005, y: 1.005))
             .cropped(to: originalCI.extent)
 
         return fg.applyingFilter("CISourceOverCompositing", parameters: [kCIInputBackgroundImageKey: bg])
@@ -180,31 +176,33 @@ final class ParallaxEngine {
         if abs(newScale - previewScale) < 0.04, pBgCI != nil, pFgCI != nil { return }
 
         previewScale = newScale
-
         if previewScale < 1 {
             let pOriginal = lanczosScale(originalCI, scale: previewScale)
             let pMask = lanczosScale(maskCI, scale: previewScale)
-
             let pTransparent = CIImage(color: .clear).cropped(to: pOriginal.extent)
+
             pFgCI = pOriginal.applyingFilter("CIBlendWithMask", parameters: [
                 kCIInputBackgroundImageKey: pTransparent,
                 kCIInputMaskImageKey: pMask
             ])
 
             let pInvMask = pMask.applyingFilter("CIColorInvert")
-            let pSlight = pOriginal
-                .transformed(by: .init(scaleX: 1.03, y: 1.03))
-                .transformed(by: .init(translationX: -pOriginal.extent.width * 0.015,
-                                       y: -pOriginal.extent.height * 0.015))
+            let bgScale: CGFloat = 1.02
+            let dx = -(pOriginal.extent.width  * (bgScale - 1) * 0.5)
+            let dy = -(pOriginal.extent.height * (bgScale - 1) * 0.5)
+            let pExpanded = pOriginal
+                .transformed(by: .init(scaleX: bgScale, y: bgScale))
+                .transformed(by: .init(translationX: dx, y: dy))
                 .cropped(to: pOriginal.extent)
-            pBgCI = pSlight.applyingFilter("CIBlendWithMask", parameters: [
+
+            pBgCI = pExpanded.applyingFilter("CIBlendWithMask", parameters: [
                 kCIInputBackgroundImageKey: pTransparent,
                 kCIInputMaskImageKey: pInvMask
             ])
 
             previewSize = pOriginal.extent.size
         } else {
-            // No downscale
+            // No downscale preview
             previewSize = outputSize
             pBgCI = bgCI
             pFgCI = fgCI
