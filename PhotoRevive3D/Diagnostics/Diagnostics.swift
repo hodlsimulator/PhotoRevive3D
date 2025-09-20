@@ -90,9 +90,17 @@ private actor LogSink {
         ensureExists()
         guard let h = try? FileHandle(forReadingFrom: logURL) else { return "(no log file yet)" }
         defer { try? h.close() }
-        let fileSize = (try? h.seekToEnd()) ?? 0
-        let offset = max(0, fileSize - UInt64(maxBytes))
-        try? h.seek(toOffset: offset)
+
+        let size: UInt64 = (try? h.seekToEnd()) ?? 0
+        let cap = max(0, maxBytes) // guard negatives
+        let off: UInt64
+        if size > UInt64(cap) {
+            off = size - UInt64(cap) // safe: only subtract when size > cap
+        } else {
+            off = 0
+        }
+
+        try? h.seek(toOffset: off)
         let data = (try? h.readToEnd()) ?? Data()
         return String(data: data, encoding: .utf8) ?? "(unreadable log)"
     }
@@ -128,11 +136,7 @@ enum Diagnostics {
         // Place a marker for *this* run immediately
         try? "running".write(to: marker, atomically: true, encoding: .utf8)
 
-        // Start MetricKit subscriber (if available)
-        if #available(iOS 14.0, *) {
-            MetricsSubscriber.shared.start()
-        }
-
+        // IMPORTANT: Do NOT start MetricKit at launch; start on-demand from a diagnostics screen if desired.
         log(.info, "Diagnostics bootstrap: didCrashLastLaunch=\(crashed ? "YES":"NO")", category: "diagnostics")
     }
 
@@ -195,7 +199,6 @@ enum Diagnostics {
         let name = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "PhotoRevive3D"
         let ver = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
-        let device = UIDevice.current
 
         var lines = [String]()
         lines.append("=== PhotoRevive3D Diagnostics Report ===")
@@ -241,14 +244,18 @@ enum Diagnostics {
     }
 
     /// Tail of the rolling log (defaults to 64 KB). Synchronous helper for UI.
+    /// NOTE: Avoids overflow by guarding subtraction.
     nonisolated
     static func tail(maxBytes: Int = 64 * 1024) -> String {
         let log = diagnosticsDir.appendingPathComponent("app.log")
         guard let h = try? FileHandle(forReadingFrom: log) else { return "(no log file yet)" }
         defer { try? h.close() }
-        let fileSize = (try? h.seekToEnd()) ?? 0
-        let offset = max(0, fileSize - UInt64(maxBytes))
-        try? h.seek(toOffset: offset)
+
+        let size: UInt64 = (try? h.seekToEnd()) ?? 0
+        let cap = max(0, maxBytes)
+        let off: UInt64 = (size > UInt64(cap)) ? (size - UInt64(cap)) : 0
+
+        try? h.seek(toOffset: off)
         let data = (try? h.readToEnd()) ?? Data()
         return String(data: data, encoding: .utf8) ?? "(unreadable log)"
     }

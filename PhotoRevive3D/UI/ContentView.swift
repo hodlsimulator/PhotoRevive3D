@@ -113,16 +113,6 @@ struct ContentView: View {
             Text("PhotoRevive 3D").font(.title2.weight(.bold))
             Spacer()
 
-            Button {
-                Task {
-                    let urls = await Diagnostics.collectShareURLs()
-                    await MainActor.run { shareSheet = ShareSheet(items: urls) }
-                }
-            } label: {
-                Label("Share Logs", systemImage: "doc.text.magnifyingglass")
-            }
-            .buttonStyle(.bordered)
-
             PhotosPicker(selection: $pickerItem, matching: .images) {
                 Label("Pick Photo", systemImage: "photo.on.rectangle.angled")
             }
@@ -419,7 +409,6 @@ struct ContentView: View {
                     let ky = next.pitch * travel
                     let motionPx = hypot(kx, ky)
 
-                    // Update UI + logs on main actor (avoids isolation errors)
                     await MainActor.run {
                         self.previewCI = out.image
                         if out.usedParallax {
