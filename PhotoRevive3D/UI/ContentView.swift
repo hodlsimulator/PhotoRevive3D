@@ -42,6 +42,9 @@ struct ContentView: View {
     @State private var pendingParams: (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)?
     @State private var previewTask: Task<Void, Never>?
 
+    // Parallax status notice for the user
+    @State private var parallaxNotice: String?
+
     @StateObject private var motion = MotionTiltProvider()
 
     var body: some View {
@@ -55,7 +58,7 @@ struct ContentView: View {
                             .aspectRatio(eng.outputAspect, contentMode: .fit)
                             .glassCard()
                     } else {
-                        placeholderCard
+                        placeholderCard  // now tappable to open Photos
                     }
                 }
                 .padding(.horizontal)
@@ -115,23 +118,46 @@ struct ContentView: View {
         .padding(.top, 12)
     }
 
+    // Tappable placeholder: opens Photos directly anywhere on the card
     private var placeholderCard: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "photo.artframe")
-                .resizable().scaledToFit().frame(width: 80)
-                .foregroundStyle(.secondary)
-            Text("Pick a photo to begin").foregroundStyle(.secondary)
+        PhotosPicker(selection: $pickerItem, matching: .images) {
+            VStack(spacing: 12) {
+                Image(systemName: "photo.artframe")
+                    .resizable().scaledToFit().frame(width: 80)
+                    .foregroundStyle(.secondary)
+                Text("Pick a photo to begin").foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, minHeight: 260)
+            .glassCard()
         }
-        .frame(maxWidth: .infinity, minHeight: 260)
-        .glassCard()
+        .buttonStyle(.plain)
+        .padding(.horizontal)
     }
 
     private var previewCard: some View {
         ZStack {
             CIRenderView(image: $previewCI)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
             if previewCI == nil {
                 ProgressView().frame(maxWidth: .infinity, minHeight: 200)
+            }
+
+            if let msg = parallaxNotice {
+                // Subtle banner to indicate fallback and why
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(msg)
+                }
+                .font(.footnote.weight(.semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay(
+                    Capsule().strokeBorder(Color.secondary.opacity(0.25), lineWidth: 0.5)
+                )
+                .padding(10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
         .overlay(
@@ -260,7 +286,7 @@ struct ContentView: View {
 
     private func loadImage(item: PhotosPickerItem?) async {
         guard let item else { return }
-        await MainActor.run { preparing = true }
+        await MainActor.run { preparing = true; parallaxNotice = nil }
         do {
             if let data = try await item.loadTransferable(type: Data.self),
                let uiImage = UIImage(data: data) {
@@ -363,11 +389,14 @@ struct ContentView: View {
                         Diagnostics.logMemory("[preview.start]")
                     }
 
-                    let ci = ParallaxEngine.composePreview(from: snapshot, yaw: next.yaw, pitch: next.pitch, intensity: next.intensity)
+                    let out = ParallaxEngine.composePreview(from: snapshot, yaw: next.yaw, pitch: next.pitch, intensity: next.intensity)
                     frames += 1
                     if frames % 60 == 0 { Diagnostics.logMemory("[preview.frames=\(frames)]") }
 
-                    await MainActor.run { self.previewCI = ci }
+                    await MainActor.run {
+                        self.previewCI = out.image
+                        self.parallaxNotice = out.usedParallax ? nil : out.reason ?? "Parallax off: fallback image"
+                    }
                 }
 
                 await MainActor.run {

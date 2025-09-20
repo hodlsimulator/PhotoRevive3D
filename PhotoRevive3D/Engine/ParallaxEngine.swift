@@ -7,6 +7,7 @@
 //  Depth-driven multi-slice parallax (no deprecated CI kernels).
 //  Foreground moves more (opposite direction), background moves less.
 //  Uses overscan + feathered/dilated band masks to avoid edge seams.
+//  Also reports when preview falls back to the plain image (with reason).
 //
 
 import Foundation
@@ -19,7 +20,7 @@ final class ParallaxEngine {
     // MARK: - Tuning
 
     /// Max per-axis travel as a fraction of the *shorter* image edge at intensity == 1.0.
-    /// 0.08 ≈ ±8% → bold, Spatial-Scenes-like swing.
+    /// 0.08 ≈ ±8% → bold swing.
     private let travelFractionAtFullIntensity: CGFloat = 0.08
 
     /// Extra overscan to hide edges at large tilts.
@@ -36,6 +37,12 @@ final class ParallaxEngine {
 
     /// Optional extra pop for nearest band (1 = linear).
     private let nearExponent: CGFloat = 1.15
+
+    /// Minimum effective depth range (0…1) for parallax. Below this we show fallback.
+    private let minDepthRangeForParallax: CGFloat = 0.015
+
+    /// Minimum motion in pixels required to bother compositing bands.
+    private let minMotionPixelsForParallax: CGFloat = 0.5
 
     // MARK: - Inputs & CI setup
 
@@ -59,6 +66,9 @@ final class ParallaxEngine {
 
     // Overscanned source for “look-around” sampling (finite extent, larger than photo)
     private var overscannedSrcCI: CIImage!
+
+    // Depth dynamic range (min…max) measured at prepare time
+    private var depthRange: CGFloat = 0
 
     // Screen-scaled preview pipeline
     private(set) var previewTargetLongest: CGFloat = 1600 // px; updated by updatePreviewLOD
@@ -92,6 +102,9 @@ final class ParallaxEngine {
         let depthRaw = clamp01(depthRes.depthCI)
         depthCI = resizeTo(depthRaw, target: originalCI.extent.size)
 
+        // Compute depth dynamic range for diagnostics.
+        depthRange = computeDepthRange(depthCI)
+
         // Overscanned source (finite extent, larger than original) for export rendering.
         let overscanScale = 1.0 + 2.0 * (travelFractionAtFullIntensity + overscanSafety)
         let w = originalCI.extent.width
@@ -100,10 +113,10 @@ final class ParallaxEngine {
         let dy = -(h * (overscanScale - 1) * 0.5)
         overscannedSrcCI = originalCI
             .transformed(by: .init(scaleX: overscanScale, y: overscanScale))
-            .transformed(by: .init(translationX: dx, y: dy)) // NOTE: no clampedToExtent() here
+            .transformed(by: .init(translationX: dx, y: dy)) // NOTE: no clampedToExtent()
 
         rebuildPreviewLayers(targetLongestPx: previewTargetLongest)
-        Diagnostics.log(.info, "ParallaxEngine prepared (size=\(Int(outputSize.width))x\(Int(outputSize.height)))", category: "engine")
+        Diagnostics.log(.info, "ParallaxEngine prepared size=\(Int(outputSize.width))x\(Int(outputSize.height)) depthRange=\(String(format: "%.4f", depthRange))", category: "engine")
     }
 
     /// Update preview LOD to match on-screen pixel size.
@@ -119,14 +132,24 @@ final class ParallaxEngine {
     // MARK: - Preview snapshot (thread-safe to *use* off-main)
 
     struct PreviewSnapshot: @unchecked Sendable {
-        let src: CIImage      // overscanned, **finite extent**, larger than frame
-        let depth: CIImage    // 0…1, **same size** as size
+        let src: CIImage      // overscanned, finite extent (≥ frame)
+        let depth: CIImage    // 0…1, exactly size
         let size: CGSize      // destination frame size
         let travelFraction: CGFloat
         let bands: Int
         let feather: CGFloat
         let dilateRadius: CGFloat
         let nearExp: CGFloat
+        let depthRange: CGFloat
+        let minDepthNeeded: CGFloat
+        let minMotionNeededPx: CGFloat
+    }
+
+    /// What we return to the preview renderer (image + whether parallax was applied).
+    struct PreviewOutput {
+        let image: CIImage
+        let usedParallax: Bool
+        let reason: String?   // non-nil when usedParallax == false
     }
 
     /// Capture immutable inputs for one preview composition.
@@ -141,7 +164,10 @@ final class ParallaxEngine {
             bands: bandCount,
             feather: bandFeather,
             dilateRadius: maskDilateRadius,
-            nearExp: nearExponent
+            nearExp: nearExponent,
+            depthRange: depthRange,
+            minDepthNeeded: minDepthRangeForParallax,
+            minMotionNeededPx: minMotionPixelsForParallax
         )
     }
 
@@ -152,7 +178,7 @@ final class ParallaxEngine {
     static func composePreview(from snap: PreviewSnapshot,
                                yaw: CGFloat,
                                pitch: CGFloat,
-                               intensity: CGFloat) -> CIImage
+                               intensity: CGFloat) -> PreviewOutput
     {
         let travel = min(snap.size.width, snap.size.height)
                    * snap.travelFraction
@@ -160,8 +186,23 @@ final class ParallaxEngine {
 
         let kx = yaw   * travel
         let ky = pitch * travel
+        let motionMag = hypot(kx, ky)
 
         let outExtent = CGRect(origin: .zero, size: snap.size)
+
+        // Check feasibility first; if not, return fallback with a reason.
+        if snap.depthRange < snap.minDepthNeeded {
+            let reason = "Parallax off: depth too flat (Δ≈\(String(format: "%.3f", Double(snap.depthRange))))"
+            return PreviewOutput(image: snap.src.cropped(to: outExtent), usedParallax: false, reason: reason)
+        }
+        if motionMag < snap.minMotionNeededPx {
+            let reason = "Parallax off: tilt too small"
+            return PreviewOutput(image: snap.src.cropped(to: outExtent), usedParallax: false, reason: reason)
+        }
+        if intensity <= 0.0001 {
+            let reason = "Parallax off: intensity is zero"
+            return PreviewOutput(image: snap.src.cropped(to: outExtent), usedParallax: false, reason: reason)
+        }
 
         // Local helper – builds a feathered, dilated band mask (exactly outExtent size).
         @inline(__always)
@@ -252,7 +293,7 @@ final class ParallaxEngine {
             ])
         }
 
-        return acc
+        return PreviewOutput(image: acc, usedParallax: true, reason: nil)
     }
 
     // MARK: - Full-resolution rendering (export)
@@ -417,6 +458,30 @@ final class ParallaxEngine {
             kCIInputScaleKey:        scale,
             kCIInputAspectRatioKey:  1.0
         ])
+    }
+
+    /// Measure min/max of a 0…1 grayscale (R channel) and return range.
+    private func computeDepthRange(_ depth: CIImage) -> CGFloat {
+        let ext = depth.extent
+        let extentVec = CIVector(x: ext.origin.x, y: ext.origin.y, z: ext.size.width, w: ext.size.height)
+
+        let minImg = depth.applyingFilter("CIAreaMinimum", parameters: [kCIInputExtentKey: extentVec])
+        let maxImg = depth.applyingFilter("CIAreaMaximum", parameters: [kCIInputExtentKey: extentVec])
+
+        func sampleR(_ img: CIImage) -> CGFloat {
+            var px = [UInt8](repeating: 0, count: 4)
+            ciContext.render(img,
+                             toBitmap: &px,
+                             rowBytes: 4,
+                             bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                             format: .RGBA8,
+                             colorSpace: CGColorSpaceCreateDeviceRGB())
+            return CGFloat(px[0]) / 255.0
+        }
+
+        let mn = sampleR(minImg)
+        let mx = sampleR(maxImg)
+        return max(0, mx - mn)
     }
 }
 
