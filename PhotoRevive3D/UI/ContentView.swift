@@ -46,6 +46,10 @@ struct ContentView: View {
     // Parallax status notice for the user (set when we fall back)
     @State private var parallaxNotice: String?
 
+    // For logging: remember last state so we only log on change
+    @State private var lastParallaxUsed: Bool?
+    @State private var lastParallaxReason: String?
+
     @StateObject private var motion = MotionTiltProvider()
 
     var body: some View {
@@ -79,13 +83,13 @@ struct ContentView: View {
             Task { await loadImage(item: newItem) }
         }
 
-        // Gyro ON/OFF side-effects run after view updates (no re-entrancy)
+        // Gyro ON/OFF side-effects
         .task(id: useMotion) {
             await Task.yield()
             if useMotion {
                 Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
                 motion.start()
-                motion.calibrateZero()      // auto-centre on toggle
+                motion.calibrateZero()
                 schedulePreview()
             } else {
                 Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
@@ -108,6 +112,17 @@ struct ContentView: View {
         HStack {
             Text("PhotoRevive 3D").font(.title2.weight(.bold))
             Spacer()
+
+            Button {
+                Task {
+                    let urls = await Diagnostics.collectShareURLs()
+                    await MainActor.run { shareSheet = ShareSheet(items: urls) }
+                }
+            } label: {
+                Label("Share Logs", systemImage: "doc.text.magnifyingglass")
+            }
+            .buttonStyle(.bordered)
+
             PhotosPicker(selection: $pickerItem, matching: .images) {
                 Label("Pick Photo", systemImage: "photo.on.rectangle.angled")
             }
@@ -286,6 +301,8 @@ struct ContentView: View {
         guard let item else { return }
         preparing = true
         parallaxNotice = nil
+        lastParallaxUsed = nil
+        lastParallaxReason = nil
         do {
             if let data = try await item.loadTransferable(type: Data.self),
                let uiImage = UIImage(data: data) {
@@ -394,9 +411,42 @@ struct ContentView: View {
                     frames += 1
                     if frames % 60 == 0 { Diagnostics.logMemory("[preview.frames=\(frames)]") }
 
+                    // Motion in px (matches engine math)
+                    let travel = min(snapshot.size.width, snapshot.size.height)
+                               * snapshot.travelFraction
+                               * max(0, next.intensity)
+                    let kx = next.yaw * travel
+                    let ky = next.pitch * travel
+                    let motionPx = hypot(kx, ky)
+
+                    // Update UI + logs on main actor (avoids isolation errors)
                     await MainActor.run {
                         self.previewCI = out.image
-                        self.parallaxNotice = out.usedParallax ? nil : (out.reason ?? "Parallax off: fallback image")
+                        if out.usedParallax {
+                            if lastParallaxUsed != true {
+                                Diagnostics.log(.info,
+                                    String(format: "parallax.on yaw=%.3f pitch=%.3f intensity=%.3f motionPx=%.2f depthRange=%.4f LOD=%d",
+                                           Double(next.yaw), Double(next.pitch), Double(next.intensity),
+                                           Double(motionPx), Double(snapshot.depthRange), Int(lodPx)),
+                                    category: "preview")
+                            }
+                            lastParallaxUsed = true
+                            lastParallaxReason = nil
+                            parallaxNotice = nil
+                        } else {
+                            let msg = out.reason ?? "unknown"
+                            if lastParallaxUsed != false || lastParallaxReason != msg {
+                                Diagnostics.log(.warn,
+                                    String(format: "parallax.off reason=\"%@\" yaw=%.3f pitch=%.3f intensity=%.3f motionPx=%.2f minMotionPx=%.2f depthRange=%.4f minDepth=%.4f LOD=%d",
+                                           msg, Double(next.yaw), Double(next.pitch), Double(next.intensity),
+                                           Double(motionPx), Double(snapshot.minMotionNeededPx),
+                                           Double(snapshot.depthRange), Double(snapshot.minDepthNeeded), Int(lodPx)),
+                                    category: "preview")
+                            }
+                            lastParallaxUsed = false
+                            lastParallaxReason = msg
+                            parallaxNotice = msg
+                        }
                     }
                 }
 

@@ -4,359 +4,363 @@
 //
 //  Created by . . on 19/09/2025.
 //
-
-// Diagnostics.swift
-// PhotoRevive3D
+//  Unified logging to OSLog and a rolling on-device log file.
+//  Includes a "Share Logs" helper, crash-marker handling, MetricKit helpers,
+//  and convenience accessors used by DiagnosticsView/MetricsSubscriber.
+//  Works in Release. Actor-safe.
+//
 
 import Foundation
-import os
+import OSLog
 import UIKit
-import Darwin // mach task_info(), gmtime_r()
 
-enum Diagnostics {
-    enum Level: String { case debug = "DEBUG", info = "INFO", warn = "WARN", error = "ERROR" }
+// MARK: - File logger actor (serialises file writes; actor-safe)
 
-    // MARK: - Bootstrap / lifecycle
+private actor LogSink {
+    static let shared = LogSink()
 
-    static func bootstrap() {
-        markLaunch()
-        MetricsSubscriber.shared.start()
-        log(.info, "Diagnostics bootstrap complete (sampler=OFF)")
-    }
+    private let fm = FileManager.default
+    private let logDir: URL
+    private let logURL: URL
+    private let maxBytes: Int = 2 * 1024 * 1024 // 2 MB rollover
+    private let df: DateFormatter
 
-    static func markLaunch() {
-        let url = markerURL()
-        try? "running".data(using: String.Encoding.utf8)?.write(to: url, options: .atomic)
-    }
-
-    static func markCleanExit() {
-        try? FileManager.default.removeItem(at: markerURL())
-    }
-
-    static var didCrashLastLaunch: Bool {
-        FileManager.default.fileExists(atPath: markerURL().path)
-    }
-
-    // MARK: - Logging (OSLog + simple rolling file; no actors, no ICU)
-
-    /// Safe to call from any thread.
-    nonisolated static func log(
-        _ level: Level = .info,
-        _ message: String,
-        category: String = "app",
-        file: String = #fileID,
-        function: String = #function,
-        line: Int = #line
-    ) {
-        let logger = Logger(subsystem: subsystem(), category: category)
-        switch level {
-        case .debug: logger.debug("\(category): \(message, privacy: .public)")
-        case .info:  logger.log("\(category): \(message, privacy: .public)")
-        case .warn:  logger.warning("\(category): \(message, privacy: .public)")
-        case .error: logger.error("\(category): \(message, privacy: .public)")
-        }
-
-        let ts = timestamp() // ICU-free
-        let lineStr = "[\(ts)] [\(level.rawValue)] [\(category)] \(message) (\(file):\(line) \(function))"
-        appendLine(lineStr)
-    }
-
-    static func tail(_ maxBytes: Int = 64 * 1024) async -> String {
-        let (fileURL, _) = logURLs()
-        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return "" }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let off = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
-        try? handle.seek(toOffset: off)
-        let data = (try? handle.readToEnd()) ?? Data()
-        return String(decoding: data, as: UTF8.self)
-    }
-
-    // MARK: - Memory sampler (REMOVED)
-
-    // Fully disabled (Release *and* Debug).
-    static func startMemorySampler(tag: String = "") { /* disabled */ }
-    static func stopMemorySampler() { /* disabled */ }
-
-    /// Log one snapshot of memory footprint (safe from any thread).
-    nonisolated static func logMemory(_ label: String = "") {
-        let mb = footprintMB()
-        if mb >= 0 {
-            let formatted = String(format: "%.1f", mb)
-            log(.info, "footprint=\(formatted) MB \(label)", category: "mem")
-        } else {
-            log(.warn, "footprint= \(label)", category: "mem")
-        }
-    }
-
-    /// Returns current process physical footprint in MB (or -1 on failure).
-    nonisolated private static func footprintMB() -> Double {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(
-            MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<integer_t>.stride
-        )
-        let kerr: kern_return_t = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
-            }
-        }
-        guard kerr == KERN_SUCCESS else { return -1 }
-        let bytes = UInt64(info.phys_footprint)
-        return Double(bytes) / 1_048_576.0
-    }
-
-    // MARK: - Clear / report
-
-    static func clearAll() async {
-        let (fileURL, backupURL) = logURLs()
-        let fm = FileManager.default
-        try? fm.removeItem(at: backupURL)
-        try? fm.removeItem(at: fileURL)
-        fm.createFile(atPath: fileURL.path, contents: nil)
-
-        let dir = diagnosticsDir()
-        if let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-            for url in files {
-                let name = url.lastPathComponent
-                if (name.hasPrefix("MX") && url.pathExtension == "json") || name == "RUNNING.marker" {
-                    try? fm.removeItem(at: url)
-                }
-            }
-        }
-    }
-
-    static func makeTextReport() async throws -> URL {
-        let summary = await MainActor.run { deviceSummary() }
-        let header = """
-        ==== PhotoRevive3D Diagnostics ====
-        Time: \(timestamp())
-        \(summary)
-        Last run crashed: \(didCrashLastLaunch ? "YES" : "NO")
-        ===================================
-
-        --- Recent Log (last 64KB) ---
-        """
-        var body = header
-        body += await tail(64 * 1024)
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("Diagnostics-\(Int(Date().timeIntervalSince1970)).txt")
-        try body.write(to: url, atomically: true, encoding: String.Encoding.utf8)
-        return url
-    }
-
-    static func collectShareURLs() async -> [URL] {
-        var urls: [URL] = []
-        if let rep = try? await makeTextReport() { urls.append(rep) }
-        urls.append(contentsOf: MetricsSubscriber.shared.savedPayloads())
-        return urls
-    }
-
-    // MARK: - Crash JSON helpers
-
-    static func lastCrashJSON() -> String? {
-        let dir = diagnosticsDir()
-        let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else {
-            return nil
-        }
-        let candidates = files.filter { $0.lastPathComponent.hasPrefix("MX") && $0.pathExtension == "json" }
-        guard let latest = candidates.max(by: { (a, b) -> Bool in
-            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return da < db
-        }) else {
-            return nil
-        }
-        return try? String(contentsOf: latest, encoding: String.Encoding.utf8)
-    }
-
-    static func lastCrashSummary() -> String? {
-        guard let text = lastCrashJSON(),
-              let data = text.data(using: String.Encoding.utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-
-        let buckets = ["crashDiagnostics", "cpuExceptionDiagnostics", "hangDiagnostics"]
-        var diag: [String: Any]? = nil
-        for key in buckets {
-            if let arr = root[key] as? [[String: Any]], let first = arr.first {
-                diag = first; break
-            }
-        }
-        guard let diag else { return "No crash diagnostics array found." }
-
-        var lines: [String] = []
-        if let ts = root["timeStampEnd"] as? String { lines.append("time=\(ts)") }
-
-        if let meta = diag["diagnosticMetaData"] as? [String: Any] {
-            let sig = intFrom(meta["signal"])
-            let exc = intFrom(meta["exceptionType"])
-            let excCode = intFrom(meta["exceptionCode"])
-            var parts: [String] = []
-            if let s = sig { parts.append("signal=\(s) (\(signalName(s)))") }
-            if let e = exc { parts.append("exceptionType=\(e) (\(machExceptionName(e)))") }
-            if let c = excCode { parts.append("code=\(c)") }
-            if !parts.isEmpty { lines.append(parts.joined(separator: " ")) }
-
-            var env: [String] = []
-            if let bid = meta["bundleIdentifier"] as? String { env.append("bundle=\(bid)") }
-            if let v = meta["appVersion"] as? String, let b = meta["appBuildVersion"] as? String { env.append("app=\(v) (\(b))") }
-            if let os = meta["osVersion"] as? String { env.append("os=\(os)") }
-            if let device = meta["deviceType"] as? String { env.append("device=\(device)") }
-            if let pidAny = meta["pid"] { env.append("pid=\(pidAny)") }
-            if !env.isEmpty { lines.append(env.joined(separator: " ")) }
-        }
-
-        if let term = diag["terminationReason"] { lines.append("terminationReason=\(term)") }
-
-        if let tree = diag["callStackTree"] as? [String: Any],
-           let stacks = tree["callStacks"] as? [[String: Any]] {
-            let chosen = stacks.first(where: { ($0["threadAttributed"] as? Bool) == true }) ?? stacks.first
-            if let frames = chosen?["callStackRootFrames"] as? [[String: Any]],
-               let (name, off) = firstUsefulFrame(from: frames, preferBinary: "PhotoRevive3D") {
-                let hex = String(off, radix: 16, uppercase: true)
-                lines.append("top=\(name) +0x\(hex)")
-            }
-        }
-
-        return lines.isEmpty ? "Crash diagnostic present but no standard fields." : lines.joined(separator: "\n")
-    }
-
-    // MARK: - Helpers
-
-    private static func intFrom(_ any: Any?) -> Int? {
-        if let i = any as? Int { return i }
-        if let n = any as? NSNumber { return n.intValue }
-        if let s = any as? String, let i = Int(s) { return i }
-        return nil
-    }
-
-    private static func firstUsefulFrame(from frames: [[String: Any]], preferBinary: String) -> (name: String, offset: Int)? {
-        var queue: [[String: Any]] = frames
-        var fallback: (String, Int)? = nil
-        while !queue.isEmpty {
-            let f = queue.removeFirst()
-            let name = f["binaryName"] as? String
-            let off = intFrom(f["offsetIntoBinaryTextSegment"])
-            if let subs = f["subFrames"] as? [[String: Any]] { queue.append(contentsOf: subs) }
-            if let name, let off {
-                if name == preferBinary { return (name, off) }
-                if fallback == nil { fallback = (name, off) }
-            }
-        }
-        return fallback
-    }
-
-    private static func signalName(_ s: Int) -> String {
-        switch s {
-        case 1: return "SIGHUP"
-        case 2: return "SIGINT"
-        case 3: return "SIGQUIT"
-        case 4: return "SIGILL"
-        case 5: return "SIGTRAP"
-        case 6: return "SIGABRT"
-        case 7: return "SIGEMT"
-        case 8: return "SIGFPE"
-        case 9: return "SIGKILL"
-        case 10: return "SIGBUS"
-        case 11: return "SIGSEGV"
-        case 12: return "SIGSYS"
-        case 13: return "SIGPIPE"
-        case 14: return "SIGALRM"
-        case 15: return "SIGTERM"
-        default: return "SIG\(s)"
-        }
-    }
-
-    private static func machExceptionName(_ e: Int) -> String {
-        switch e {
-        case 1: return "EXC_BAD_ACCESS"
-        case 2: return "EXC_BAD_INSTRUCTION"
-        case 3: return "EXC_ARITHMETIC"
-        case 4: return "EXC_EMULATION"
-        case 5: return "EXC_SOFTWARE"
-        case 6: return "EXC_BREAKPOINT"
-        case 7: return "EXC_SYSCALL"
-        case 8: return "EXC_MACH_SYSCALL"
-        case 9: return "EXC_RPC_ALERT"
-        case 10: return "EXC_CRASH"
-        case 11: return "EXC_RESOURCE"
-        case 12: return "EXC_GUARD"
-        case 13: return "EXC_CORPSE_NOTIFY"
-        default: return "EXC_\(e)"
-        }
-    }
-
-    private static func markerURL() -> URL {
-        diagnosticsDir().appendingPathComponent("RUNNING.marker")
-    }
-
-    nonisolated static func diagnosticsDir() -> URL {
-        let fm = FileManager.default
-        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+    init() {
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let dir = base.appendingPathComponent("Diagnostics", isDirectory: true)
         if !fm.fileExists(atPath: dir.path) {
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
+        self.logDir = dir
+        self.logURL = dir.appendingPathComponent("app.log")
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        self.df = formatter
+
+        // Ensure file exists
+        if !fm.fileExists(atPath: logURL.path) {
+            try? "".write(to: logURL, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func timestamp() -> String {
+        df.string(from: Date())
+    }
+
+    private func ensureExists() {
+        if !fm.fileExists(atPath: logURL.path) {
+            try? "".write(to: logURL, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func rollIfNeeded() {
+        guard let attrs = try? fm.attributesOfItem(atPath: logURL.path),
+              let size = attrs[.size] as? NSNumber,
+              size.intValue > maxBytes else { return }
+
+        let bak = logURL.deletingPathExtension().appendingPathExtension("1.log")
+        try? fm.removeItem(at: bak)
+        try? fm.copyItem(at: logURL, to: bak)
+        try? "".write(to: logURL, atomically: true, encoding: .utf8)
+    }
+
+    func write(level: Diagnostics.Level, message: String, category: String) {
+        ensureExists()
+        let line = "\(timestamp()) [\(level.rawValue)] [\(category)] \(message)\n"
+
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            defer { try? handle.close() }
+            do {
+                try handle.seekToEnd()
+                if let data = line.data(using: .utf8) {
+                    try handle.write(contentsOf: data)
+                }
+            } catch {
+                try? line.write(to: logURL, atomically: true, encoding: .utf8)
+            }
+        } else {
+            try? line.write(to: logURL, atomically: true, encoding: .utf8)
+        }
+
+        rollIfNeeded()
+    }
+
+    func tail(maxBytes: Int) -> String {
+        ensureExists()
+        guard let h = try? FileHandle(forReadingFrom: logURL) else { return "(no log file yet)" }
+        defer { try? h.close() }
+        let fileSize = (try? h.seekToEnd()) ?? 0
+        let offset = max(0, fileSize - UInt64(maxBytes))
+        try? h.seek(toOffset: offset)
+        let data = (try? h.readToEnd()) ?? Data()
+        return String(data: data, encoding: .utf8) ?? "(unreadable log)"
+    }
+
+    func logFileURL() -> URL {
+        ensureExists()
+        return logURL
+    }
+
+    func diagnosticsDirURL() -> URL {
+        return logDir
+    }
+}
+
+// MARK: - Public API
+
+enum Diagnostics {
+
+    enum Level: String { case debug = "DEBUG", info = "INFO", warn = "WARN", error = "ERROR" }
+
+    // Crash marker -------------------------------------------------------------
+
+    /// Call once at app start (see App.init()).
+    @MainActor
+    static func bootstrap() {
+        // Determine crash marker from last run
+        let marker = crashMarkerURL()
+        let crashed = FileManager.default.fileExists(atPath: marker.path)
+
+        // Persist for this launch (readable anywhere without actor hops)
+        UserDefaults.standard.set(crashed, forKey: "Diagnostics.didCrashLastLaunch")
+
+        // Place a marker for *this* run immediately
+        try? "running".write(to: marker, atomically: true, encoding: .utf8)
+
+        // Start MetricKit subscriber (if available)
+        if #available(iOS 14.0, *) {
+            MetricsSubscriber.shared.start()
+        }
+
+        log(.info, "Diagnostics bootstrap: didCrashLastLaunch=\(crashed ? "YES":"NO")", category: "diagnostics")
+    }
+
+    /// Remove the crash marker to indicate a clean exit/background transition.
+    @MainActor
+    static func markCleanExit() {
+        let marker = crashMarkerURL()
+        try? FileManager.default.removeItem(at: marker)
+        log(.info, "Marked clean exit (removed crash marker)", category: "diagnostics")
+    }
+
+    /// True if the previous launch did not remove its marker (i.e., crashed/killed).
+    nonisolated
+    static var didCrashLastLaunch: Bool {
+        UserDefaults.standard.bool(forKey: "Diagnostics.didCrashLastLaunch")
+    }
+
+    // Logging -----------------------------------------------------------------
+
+    /// Thread-safe logging; callable from any context (background or main).
+    nonisolated
+    static func log(_ level: Level, _ message: String, category: String = "app") {
+        // OSLog (immediate)
+        let logger = Logger(subsystem: "PhotoRevive3D", category: category)
+        switch level {
+        case .debug: logger.debug("\(message, privacy: .public)")
+        case .info:  logger.info("\(message, privacy: .public)")
+        case .warn:  logger.warning("\(message, privacy: .public)")
+        case .error: logger.error("\(message, privacy: .public)")
+        }
+
+        // File (async via actor)
+        Task.detached(priority: .utility) {
+            await LogSink.shared.write(level: level, message: message, category: category)
+        }
+    }
+
+    /// Lightweight memory/thermal note; callable from any context.
+    nonisolated
+    static func logMemory(_ note: String = "") {
+        let thermal: String
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: thermal = "nominal"
+        case .fair:    thermal = "fair"
+        case .serious: thermal = "serious"
+        case .critical:thermal = "critical"
+        @unknown default: thermal = "unknown"
+        }
+        let msg = "[mem] \(note) thermal=\(thermal) uptime=\(String(format: "%.0fs", ProcessInfo.processInfo.systemUptime))"
+        log(.info, msg, category: "mem")
+    }
+
+    // Share/report ------------------------------------------------------------
+
+    /// Builds a short report + returns `[report.txt, app.log]` for sharing.
+    @MainActor
+    static func collectShareURLs() async -> [URL] {
+        // Build report header on main (safe to touch UIKit here)
+        let bundle = Bundle.main
+        let name = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "PhotoRevive3D"
+        let ver = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        let device = UIDevice.current
+
+        var lines = [String]()
+        lines.append("=== PhotoRevive3D Diagnostics Report ===")
+        lines.append("Generated: \(timestamp)")
+        lines.append("App: \(name) \(ver) (\(build))")
+        lines.append("Bundle: \(bundle.bundleIdentifier ?? "?")")
+        lines.append(deviceSummary)
+        lines.append("Last run crashed: \(didCrashLastLaunch ? "YES" : "NO")")
+        lines.append("")
+
+        // Tail of file via actor
+        let tailStr = await LogSink.shared.tail(maxBytes: 200_000)
+        lines.append("=== Log Tail (200000 bytes max) ===")
+        lines.append(tailStr)
+        lines.append("=== End ===")
+
+        // Write report
+        let reportURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PhotoRevive3D-report-\(Int(Date().timeIntervalSince1970)).txt")
+        do {
+            try lines.joined(separator: "\n").data(using: .utf8)?.write(to: reportURL, options: .atomic)
+        } catch {
+            log(.error, "Failed to write report: \(error)", category: "diagnostics")
+        }
+
+        // Return report + current log file
+        let logURL = await LogSink.shared.logFileURL()
+        return [reportURL, logURL]
+    }
+
+    // Convenience used by DiagnosticsView ------------------------------------
+
+    /// Diagnostics directory URL (for MetricKit files, etc.)
+    nonisolated
+    static var diagnosticsDir: URL {
+        // Mirror LogSink’s directory without crossing the actor.
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("Diagnostics", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
         return dir
     }
 
-    nonisolated static func subsystem() -> String {
-        Bundle.main.bundleIdentifier ?? "PhotoRevive3D"
+    /// Tail of the rolling log (defaults to 64 KB). Synchronous helper for UI.
+    nonisolated
+    static func tail(maxBytes: Int = 64 * 1024) -> String {
+        let log = diagnosticsDir.appendingPathComponent("app.log")
+        guard let h = try? FileHandle(forReadingFrom: log) else { return "(no log file yet)" }
+        defer { try? h.close() }
+        let fileSize = (try? h.seekToEnd()) ?? 0
+        let offset = max(0, fileSize - UInt64(maxBytes))
+        try? h.seek(toOffset: offset)
+        let data = (try? h.readToEnd()) ?? Data()
+        return String(data: data, encoding: .utf8) ?? "(unreadable log)"
     }
 
-    @MainActor static func deviceSummary() -> String {
-        let b = Bundle.main
-        let v = b.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
-        let build = b.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
-        let d = UIDevice.current
-        return "App \(v) (\(build)) — iOS \(d.systemVersion) — \(d.model)"
-    }
-
-    /// ICU-free timestamp like 2025-09-19T21:23:18.540Z
-    nonisolated static func timestamp() -> String {
-        var t = time(nil)
-        var g = tm()
-        gmtime_r(&t, &g)
-        let now = Date().timeIntervalSince1970
-        let ms = Int((now - floor(now)) * 1000.0)
-        return String(
-            format: "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-            g.tm_year + 1900, g.tm_mon + 1, g.tm_mday,
-            g.tm_hour, g.tm_min, g.tm_sec, ms
-        )
-    }
-
-    // MARK: - Private file helpers
-
-    nonisolated private static func appendLine(_ line: String) {
+    /// Delete app.log, backup log, MetricKit JSON payloads, and the crash marker.
+    nonisolated
+    static func clearAll() async {
         let fm = FileManager.default
-        let (fileURL, backupURL) = logURLs()
-        if !fm.fileExists(atPath: fileURL.path) {
-            fm.createFile(atPath: fileURL.path, contents: nil)
+        let dir = diagnosticsDir
+
+        // Logs
+        let log = dir.appendingPathComponent("app.log")
+        let bak = dir.appendingPathComponent("app.1.log")
+        try? fm.removeItem(at: log)
+        try? fm.removeItem(at: bak)
+        try? "".write(to: log, atomically: true, encoding: .utf8)
+
+        // MetricKit JSON
+        if let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            for url in items where url.pathExtension.lowercased() == "json" {
+                try? fm.removeItem(at: url)
+            }
         }
-        guard let data = (line + "\n").data(using: .utf8),
-              let handle = try? FileHandle(forWritingTo: fileURL) else { return }
-        defer { try? handle.close() }
-        do {
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-        } catch { /* ignore */ }
-        if let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
-           let size = (attrs[.size] as? NSNumber)?.intValue,
-           size > 512 * 1024 {
-            try? fm.removeItem(at: backupURL)
-            try? fm.moveItem(at: fileURL, to: backupURL)
-            fm.createFile(atPath: fileURL.path, contents: nil)
-        }
+
+        // Crash marker
+        try? fm.removeItem(at: crashMarkerURL())
+
+        // Note in the fresh log
+        await LogSink.shared.write(level: .info, message: "Diagnostics cleared", category: "diagnostics")
     }
 
-    nonisolated private static func logURLs() -> (URL, URL) {
-        let dir = diagnosticsDir()
-        return (
-            dir.appendingPathComponent("app.log"),
-            dir.appendingPathComponent("app.1.log")
-        )
+    /// Human-readable device summary (used in the Diagnostics screen/report).
+    @MainActor
+    static var deviceSummary: String {
+        let d = UIDevice.current
+        return "Device: \(d.model) (\(d.systemName) \(d.systemVersion))"
+    }
+
+    /// ISO-style timestamp string (used by DiagnosticsView).
+    nonisolated
+    static var timestamp: String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return f.string(from: Date())
+    }
+
+    /// Latest MetricKit diagnostic JSON (if any), as a String.
+    nonisolated
+    static var lastCrashJSON: String? {
+        let dir = diagnosticsDir
+        let fm = FileManager.default
+        let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])) ?? []
+        // Prefer MXDiag*.json; fall back to any MX*.json
+        let candidates = files.filter { $0.lastPathComponent.hasPrefix("MXDiag") && $0.pathExtension.lowercased() == "json" }
+        let pool = candidates.isEmpty ? files.filter { $0.lastPathComponent.hasPrefix("MX") && $0.pathExtension.lowercased() == "json" } : candidates
+        guard !pool.isEmpty else { return nil }
+
+        let latest = pool.max(by: { (a, b) -> Bool in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+            return da < db
+        })!
+
+        return try? String(contentsOf: latest, encoding: .utf8)
+    }
+
+    /// Very small summary derived from the latest MX diagnostic JSON.
+    nonisolated
+    static var lastCrashSummary: String? {
+        guard let json = lastCrashJSON,
+              let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        // MXDiagnosticPayload JSON typically has "crashDiagnostics": [ { ... } ]
+        if let arr = obj["crashDiagnostics"] as? [[String: Any]],
+           let first = arr.first {
+            let signal = (first["signal"] as? String) ?? ""
+            let exceptionType = (first["exceptionType"] as? NSNumber)?.stringValue ?? ""
+            let termination = (first["terminationReason"] as? String) ?? ""
+            var topSymbol: String = ""
+
+            if let tree = first["callStackTree"] as? [String: Any],
+               let stacks = tree["callStacks"] as? [[String: Any]],
+               let firstStack = stacks.first,
+               let frames = firstStack["frames"] as? [[String: Any]],
+               let top = frames.first {
+                topSymbol = (top["symbol"] as? String)
+                    ?? (top["binaryName"] as? String)
+                    ?? ""
+            }
+
+            var parts: [String] = []
+            if !signal.isEmpty { parts.append("signal \(signal)") }
+            if !exceptionType.isEmpty { parts.append("exceptionType \(exceptionType)") }
+            if !termination.isEmpty { parts.append(termination) }
+            if !topSymbol.isEmpty { parts.append("top: \(topSymbol)") }
+
+            return parts.isEmpty ? "Crash payload present" : parts.joined(separator: " — ")
+        }
+
+        // Some payloads may have "hangDiagnostics" or others; indicate presence.
+        if obj["hangDiagnostics"] != nil { return "Hang payload present" }
+        if obj["cpuExceptionDiagnostics"] != nil { return "CPU exception payload present" }
+        return nil
+    }
+
+    // MARK: - Internals
+
+    nonisolated
+    private static func crashMarkerURL() -> URL {
+        diagnosticsDir.appendingPathComponent("crash.marker")
     }
 }
