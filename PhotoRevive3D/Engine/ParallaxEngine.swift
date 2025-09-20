@@ -57,7 +57,7 @@ final class ParallaxEngine {
     private(set) var outputSize: CGSize
     var outputAspect: CGFloat { outputSize.width / outputSize.height }
 
-    // Overscanned source for “look-around” sampling
+    // Overscanned source for “look-around” sampling (finite extent, larger than photo)
     private var overscannedSrcCI: CIImage!
 
     // Screen-scaled preview pipeline
@@ -87,16 +87,20 @@ final class ParallaxEngine {
         // Build synthetic depth (0…1, white=near) entirely on-device.
         let ui = UIImage(from: originalCI, context: ciContext)
         let depthRes = try DepthEstimator.makeDepth(for: ui)
-        self.depthCI = clamp01(depthRes.depthCI)
 
-        // Overscanned source so band translations don’t reveal edges.
+        // Normalise and **resize depth to exactly match the photo**.
+        let depthRaw = clamp01(depthRes.depthCI)
+        depthCI = resizeTo(depthRaw, target: originalCI.extent.size)
+
+        // Overscanned source (finite extent, larger than original) for export rendering.
         let overscanScale = 1.0 + 2.0 * (travelFractionAtFullIntensity + overscanSafety)
-        let dx = -(originalCI.extent.width  * (overscanScale - 1) * 0.5)
-        let dy = -(originalCI.extent.height * (overscanScale - 1) * 0.5)
+        let w = originalCI.extent.width
+        let h = originalCI.extent.height
+        let dx = -(w * (overscanScale - 1) * 0.5)
+        let dy = -(h * (overscanScale - 1) * 0.5)
         overscannedSrcCI = originalCI
             .transformed(by: .init(scaleX: overscanScale, y: overscanScale))
-            .transformed(by: .init(translationX: dx, y: dy))
-            .clampedToExtent()
+            .transformed(by: .init(translationX: dx, y: dy)) // NOTE: no clampedToExtent() here
 
         rebuildPreviewLayers(targetLongestPx: previewTargetLongest)
         Diagnostics.log(.info, "ParallaxEngine prepared (size=\(Int(outputSize.width))x\(Int(outputSize.height)))", category: "engine")
@@ -115,8 +119,8 @@ final class ParallaxEngine {
     // MARK: - Preview snapshot (thread-safe to *use* off-main)
 
     struct PreviewSnapshot: @unchecked Sendable {
-        let src: CIImage      // overscanned
-        let depth: CIImage    // 0…1
+        let src: CIImage      // overscanned, **finite extent**, larger than frame
+        let depth: CIImage    // 0…1, **same size** as size
         let size: CGSize      // destination frame size
         let travelFraction: CGFloat
         let bands: Int
@@ -158,11 +162,11 @@ final class ParallaxEngine {
         let ky = pitch * travel
 
         let outExtent = CGRect(origin: .zero, size: snap.size)
-        let transparent = CIImage(color: .clear).cropped(to: outExtent)
 
-        // Local helper lives in the same isolation as this function.
+        // Local helper – builds a feathered, dilated band mask (exactly outExtent size).
         @inline(__always)
         func bandMask(depth: CIImage,
+                      targetExtent: CGRect,
                       lower: CGFloat,
                       upper: CGFloat,
                       feather: CGFloat,
@@ -205,15 +209,19 @@ final class ParallaxEngine {
                 kCIInputRadiusKey: max(0, dilateRadius)
             ])
 
-            return dilated.applyingFilter("CIColorClamp", parameters: [
-                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
-                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
-            ])
+            return dilated
+                .applyingFilter("CIColorClamp", parameters: [
+                    "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                    "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+                ])
+                .transformed(by: .identity)
+                .cropped(to: targetExtent)
         }
 
-        var acc = CIImage(color: .clear).cropped(to: outExtent)
+        // Start with the unshifted base so you always see content.
+        var acc = snap.src.cropped(to: outExtent)
 
-        // Compose back-to-front: far → near.
+        // Compose back-to-front: far → near, replacing masked regions each pass.
         for i in 0..<snap.bands {
             let a = CGFloat(i) / CGFloat(snap.bands)
             let b = CGFloat(i + 1) / CGFloat(snap.bands)
@@ -227,7 +235,8 @@ final class ParallaxEngine {
             let dx = kx * w
             let dy = ky * w
 
-            let band = bandMask(depth: snap.depth,
+            let mask = bandMask(depth: snap.depth,
+                                targetExtent: outExtent,
                                 lower: a,
                                 upper: b,
                                 feather: snap.feather,
@@ -237,13 +246,9 @@ final class ParallaxEngine {
                 .transformed(by: .init(translationX: dx, y: dy))
                 .cropped(to: outExtent)
 
-            let layer = shifted.applyingFilter("CIBlendWithMask", parameters: [
-                kCIInputBackgroundImageKey: transparent,
-                kCIInputMaskImageKey:       band
-            ])
-
-            acc = layer.applyingFilter("CISourceOverCompositing", parameters: [
-                kCIInputBackgroundImageKey: acc
+            acc = shifted.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: acc,
+                kCIInputMaskImageKey:       mask
             ])
         }
 
@@ -261,10 +266,10 @@ final class ParallaxEngine {
         let ky = pitch * travel
 
         let outExtent = originalCI.extent
-        let transparent = CIImage(color: .clear).cropped(to: outExtent)
 
         @inline(__always)
         func bandMask(depth: CIImage,
+                      targetExtent: CGRect,
                       lower: CGFloat,
                       upper: CGFloat,
                       feather: CGFloat,
@@ -307,13 +312,17 @@ final class ParallaxEngine {
                 kCIInputRadiusKey: max(0, dilateRadius)
             ])
 
-            return dilated.applyingFilter("CIColorClamp", parameters: [
-                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
-                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
-            ])
+            return dilated
+                .applyingFilter("CIColorClamp", parameters: [
+                    "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                    "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+                ])
+                .transformed(by: .identity)
+                .cropped(to: targetExtent)
         }
 
-        var acc = CIImage(color: .clear).cropped(to: outExtent)
+        // Base (unshifted) so there’s always visible output.
+        var acc = overscannedSrcCI.cropped(to: outExtent)
 
         for i in 0..<bandCount {
             let a = CGFloat(i) / CGFloat(bandCount)
@@ -327,7 +336,8 @@ final class ParallaxEngine {
             let dx = kx * w
             let dy = ky * w
 
-            let band = bandMask(depth: depthCI,
+            let mask = bandMask(depth: depthCI,
+                                targetExtent: outExtent,
                                 lower: a,
                                 upper: b,
                                 feather: bandFeather,
@@ -337,13 +347,9 @@ final class ParallaxEngine {
                 .transformed(by: .init(translationX: dx, y: dy))
                 .cropped(to: outExtent)
 
-            let layer = shifted.applyingFilter("CIBlendWithMask", parameters: [
-                kCIInputBackgroundImageKey: transparent,
-                kCIInputMaskImageKey:       band
-            ])
-
-            acc = layer.applyingFilter("CISourceOverCompositing", parameters: [
-                kCIInputBackgroundImageKey: acc
+            acc = shifted.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: acc,
+                kCIInputMaskImageKey:       mask
             ])
         }
 
@@ -362,12 +368,28 @@ final class ParallaxEngine {
 
         previewScale = newScale
 
+        // Build finite-extent overscanned **preview** sources derived from scaled originals.
+        let overscanScale = 1.0 + 2.0 * (travelFractionAtFullIntensity + overscanSafety)
+
         if previewScale < 1 {
-            pSrc   = lanczosScale(overscannedSrcCI, scale: previewScale)
-            pDepth = lanczosScale(depthCI,        scale: previewScale)
-            previewSize = CGSize(width: originalCI.extent.width  * previewScale,
-                                 height: originalCI.extent.height * previewScale)
+            // Downscale originals isotropically.
+            let pOriginal = lanczosScale(originalCI, scale: previewScale)
+            let pDepthRaw = lanczosScale(depthCI,    scale: previewScale)
+
+            // Overscan the scaled original (finite extent, larger than pOriginal).
+            let w = pOriginal.extent.width
+            let h = pOriginal.extent.height
+            let dx = -(w * (overscanScale - 1) * 0.5)
+            let dy = -(h * (overscanScale - 1) * 0.5)
+            let pOverscanned = pOriginal
+                .transformed(by: .init(scaleX: overscanScale, y: overscanScale))
+                .transformed(by: .init(translationX: dx, y: dy))
+
+            pSrc = pOverscanned
+            pDepth = pDepthRaw
+            previewSize = pOriginal.extent.size
         } else {
+            // 1:1 preview
             pSrc = overscannedSrcCI
             pDepth = depthCI
             previewSize = outputSize
@@ -379,6 +401,15 @@ final class ParallaxEngine {
             "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
             "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
         ])
+    }
+
+    /// Anisotropic resize to a target size (for depth).
+    private func resizeTo(_ image: CIImage, target: CGSize) -> CIImage {
+        let sx = target.width  / max(1, image.extent.width)
+        let sy = target.height / max(1, image.extent.height)
+        return image
+            .transformed(by: .init(scaleX: sx, y: sy))
+            .cropped(to: CGRect(origin: .zero, size: target))
     }
 
     private func lanczosScale(_ image: CIImage, scale: CGFloat) -> CIImage {
