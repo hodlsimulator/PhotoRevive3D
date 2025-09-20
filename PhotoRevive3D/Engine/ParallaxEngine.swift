@@ -4,8 +4,9 @@
 //
 //  Created by . . on 9/19/25.
 //
-//  Renders a 2-layer parallax (background vs subject) using the depth/mask.
-//  Full-res for export; screen-scaled pipeline for live preview.
+//  Depth-driven multi-slice parallax (no deprecated CI kernels).
+//  Foreground moves more (opposite direction), background moves less.
+//  Uses overscan + feathered/dilated band masks to avoid edge seams.
 //
 
 import Foundation
@@ -15,30 +16,32 @@ import UIKit
 
 final class ParallaxEngine {
 
-    // MARK: - Tuning (Spatial Scenes feel)
-    //
-    // travelFractionAtFullIntensity:
-    //   Fraction of the *shorter* image edge used as max per-axis travel
-    //   when intensity == 1.0. 0.08 ≈ ±8% → large, Spatial-Scenes-like swing.
-    //
-    // fgParallaxFactor:
-    //   Foreground (subject) moves opposite the background at this ratio.
-    //   0.85 gives a strong depth split without looking detached.
-    //
-    // bgOverscanSafety:
-    //   Extra margin (fraction of short edge) added to the background
-    //   expansion so big tilts do not reveal edges.
+    // MARK: - Tuning
+
+    /// Max per-axis travel as a fraction of the *shorter* image edge at intensity == 1.0.
+    /// 0.08 ≈ ±8% → bold, Spatial-Scenes-like swing.
     private let travelFractionAtFullIntensity: CGFloat = 0.08
-    private let fgParallaxFactor: CGFloat = 0.85
-    private let bgOverscanSafety: CGFloat = 0.01
+
+    /// Extra overscan to hide edges at large tilts.
+    private let overscanSafety: CGFloat = 0.02
+
+    /// Number of depth bands (more = smoother, slower). 6–10 is a good range.
+    private let bandCount: Int = 8
+
+    /// Band feather width in depth units (0…1). Larger → softer band edges.
+    private let bandFeather: CGFloat = 0.15
+
+    /// Dilate masks a hair to hide inter-band seams when bands move differently.
+    private let maskDilateRadius: CGFloat = 1.0
+
+    /// Optional extra pop for nearest band (1 = linear).
+    private let nearExponent: CGFloat = 1.15
 
     // MARK: - Inputs & CI setup
 
     private(set) var originalCI: CIImage
-    private(set) var depthCI: CIImage!
-    private(set) var personMaskCI: CIImage?
+    private(set) var depthCI: CIImage!      // grayscale 0…1 (white = near)
 
-    /// CIContext for both preview + export (keep caches low to avoid spikes).
     private let ciContext: CIContext = {
         let linear = CGColorSpace(name: CGColorSpace.linearSRGB)!
         let outCS  = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -50,21 +53,21 @@ final class ParallaxEngine {
         ])
     }()
 
-    // Full-resolution output (used by exporter)
+    // Full-resolution output
     private(set) var outputSize: CGSize
     var outputAspect: CGFloat { outputSize.width / outputSize.height }
 
-    // Precomputed full-res layers
-    private var bgCI: CIImage!
-    private var fgCI: CIImage!
-    private var maskCI: CIImage!
+    // Overscanned source for “look-around” sampling
+    private var overscannedSrcCI: CIImage!
 
     // Screen-scaled preview pipeline
     private(set) var previewTargetLongest: CGFloat = 1600 // px; updated by updatePreviewLOD
     private var previewScale: CGFloat = 1
+    private var pDepth: CIImage!
+    private var pSrc: CIImage!
     private var previewSize: CGSize = .zero
-    private var pBgCI: CIImage!
-    private var pFgCI: CIImage!
+
+    // MARK: - Init
 
     init(image uiImage: UIImage) {
         if let cg = uiImage.cgImage {
@@ -81,52 +84,25 @@ final class ParallaxEngine {
     /// Must be called once after init.
     @MainActor
     func prepare() async throws {
-        // Build synthetic depth + (optional) person mask
+        // Build synthetic depth (0…1, white=near) entirely on-device.
         let ui = UIImage(from: originalCI, context: ciContext)
         let depthRes = try DepthEstimator.makeDepth(for: ui)
-        self.depthCI = depthRes.depthCI
-        self.personMaskCI = depthRes.personMaskCI
+        self.depthCI = clamp01(depthRes.depthCI)
 
-        // If no person mask, derive a soft mask from nearest depth
-        let subjectMask: CIImage = personMaskCI ?? depthThreshold(depthCI, threshold: 0.6)
-
-        // Slightly expand mask to soften edges
-        let softMask = subjectMask
-            .clampedToExtent()
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 5.0])
-            .cropped(to: originalCI.extent)
-        self.maskCI = clamp01(softMask)
-
-        // Foreground = image over transparent using mask
-        let transparent = CIImage(color: .clear).cropped(to: originalCI.extent)
-        fgCI = originalCI.applyingFilter("CIBlendWithMask", parameters: [
-            kCIInputBackgroundImageKey: transparent,
-            kCIInputMaskImageKey:       maskCI as Any
-        ])
-
-        // Background = image over transparent using inverted mask, scaled up
-        // to provide enough overscan for the larger travel.
-        let invMask = maskCI.applyingFilter("CIColorInvert")
-
-        // Overscan scale derived from the requested max travel (worst-case axis = short edge).
-        let overscanScale: CGFloat = 1.0 + 2.0 * (travelFractionAtFullIntensity + bgOverscanSafety)
+        // Overscanned source so band translations don’t reveal edges.
+        let overscanScale = 1.0 + 2.0 * (travelFractionAtFullIntensity + overscanSafety)
         let dx = -(originalCI.extent.width  * (overscanScale - 1) * 0.5)
         let dy = -(originalCI.extent.height * (overscanScale - 1) * 0.5)
-
-        let bgExpanded = originalCI
+        overscannedSrcCI = originalCI
             .transformed(by: .init(scaleX: overscanScale, y: overscanScale))
             .transformed(by: .init(translationX: dx, y: dy))
-            .cropped(to: originalCI.extent)
-
-        bgCI = bgExpanded.applyingFilter("CIBlendWithMask", parameters: [
-            kCIInputBackgroundImageKey: transparent,
-            kCIInputMaskImageKey:       invMask
-        ])
+            .clampedToExtent()
 
         rebuildPreviewLayers(targetLongestPx: previewTargetLongest)
+        Diagnostics.log(.info, "ParallaxEngine prepared (size=\(Int(outputSize.width))x\(Int(outputSize.height)))", category: "engine")
     }
 
-    /// Update preview LOD to match on-screen pixel size (Photos-style).
+    /// Update preview LOD to match on-screen pixel size.
     @MainActor
     func updatePreviewLOD(targetLongestPx: CGFloat) {
         let quantised = max(256, (targetLongestPx / 64).rounded() * 64)
@@ -139,55 +115,139 @@ final class ParallaxEngine {
     // MARK: - Preview snapshot (thread-safe to *use* off-main)
 
     struct PreviewSnapshot: @unchecked Sendable {
-        let bg: CIImage
-        let fg: CIImage
-        let size: CGSize
+        let src: CIImage      // overscanned
+        let depth: CIImage    // 0…1
+        let size: CGSize      // destination frame size
         let travelFraction: CGFloat
-        let fgFactor: CGFloat
+        let bands: Int
+        let feather: CGFloat
+        let dilateRadius: CGFloat
+        let nearExp: CGFloat
     }
 
     /// Capture immutable inputs for one preview composition.
     @MainActor
     func makePreviewSnapshot() -> PreviewSnapshot? {
-        guard let pBgCI, let pFgCI else { return nil }
+        guard let pSrc, let pDepth else { return nil }
         return PreviewSnapshot(
-            bg: pBgCI,
-            fg: pFgCI,
+            src: pSrc,
+            depth: pDepth,
             size: previewSize,
             travelFraction: travelFractionAtFullIntensity,
-            fgFactor: fgParallaxFactor
+            bands: bandCount,
+            feather: bandFeather,
+            dilateRadius: maskDilateRadius,
+            nearExp: nearExponent
         )
     }
 
-    /// Pure function: compose a preview CIImage from a snapshot + params (off-main friendly).
-    /// No per-frame scaling: only translations, so there’s no “zoom creep”.
+    // MARK: - Composition
+
+    /// Pure function: compose a preview CIImage from a snapshot + params.
     nonisolated
     static func composePreview(from snap: PreviewSnapshot,
                                yaw: CGFloat,
                                pitch: CGFloat,
                                intensity: CGFloat) -> CIImage
     {
-        // Allow large travel (Spatial Scenes vibe).
         let travel = min(snap.size.width, snap.size.height)
                    * snap.travelFraction
                    * max(0, intensity)
 
-        let bgTx = yaw   * travel
-        let bgTy = pitch * travel
+        let kx = yaw   * travel
+        let ky = pitch * travel
 
-        let fgTx = -yaw   * travel * snap.fgFactor
-        let fgTy = -pitch * travel * snap.fgFactor
+        let outExtent = CGRect(origin: .zero, size: snap.size)
+        let transparent = CIImage(color: .clear).cropped(to: outExtent)
 
-        let bg = snap.bg
-            .transformed(by: .init(translationX: bgTx, y: bgTy))
-            .cropped(to: snap.bg.extent)
+        // Local helper lives in the same isolation as this function.
+        @inline(__always)
+        func bandMask(depth: CIImage,
+                      lower: CGFloat,
+                      upper: CGFloat,
+                      feather: CGFloat,
+                      dilateRadius: CGFloat) -> CIImage
+        {
+            let eps = max(0.0001, feather)
 
-        let fg = snap.fg
-            .transformed(by: .init(translationX: fgTx, y: fgTy))
-            .cropped(to: snap.fg.extent)
+            let up = depth.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector":    CIVector(x: 1/eps, y: 0, z: 0, w: 0),
+                "inputGVector":    CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputBVector":    CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputAVector":    CIVector(x: 0, y: 0, z: 0, w: 1),
+                "inputBiasVector": CIVector(x: -lower/eps, y: -lower/eps, z: -lower/eps, w: 0)
+            ]).applyingFilter("CIColorClamp", parameters: [
+                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+            ])
 
-        return fg.applyingFilter("CISourceOverCompositing",
-                                 parameters: [kCIInputBackgroundImageKey: bg])
+            let down = depth.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector":    CIVector(x: -1/eps, y: 0, z: 0, w: 0),
+                "inputGVector":    CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputBVector":    CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputAVector":    CIVector(x: 0, y: 0, z: 0, w: 1),
+                "inputBiasVector": CIVector(x:  upper/eps, y:  upper/eps, z:  upper/eps, w: 0)
+            ]).applyingFilter("CIColorClamp", parameters: [
+                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+            ])
+
+            let band = up.applyingFilter("CIMinimumCompositing", parameters: [
+                kCIInputBackgroundImageKey: down
+            ])
+
+            let blurred = band
+                .clampedToExtent()
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: max(0.5, eps * 10)])
+                .cropped(to: depth.extent)
+
+            let dilated = blurred.applyingFilter("CIMorphologyMaximum", parameters: [
+                kCIInputRadiusKey: max(0, dilateRadius)
+            ])
+
+            return dilated.applyingFilter("CIColorClamp", parameters: [
+                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+            ])
+        }
+
+        var acc = CIImage(color: .clear).cropped(to: outExtent)
+
+        // Compose back-to-front: far → near.
+        for i in 0..<snap.bands {
+            let a = CGFloat(i) / CGFloat(snap.bands)
+            let b = CGFloat(i + 1) / CGFloat(snap.bands)
+            let mid = (a + b) * 0.5
+
+            // Motion weight: far(+1) … mid(0) … near(−1), with a touch more for near.
+            let signed = (0.5 - mid) * 2.0
+            let sgn: CGFloat = (signed == 0) ? 0 : (signed > 0 ? 1 : -1)
+            let w = sgn * pow(abs(signed), max(snap.nearExp, 1.0))
+
+            let dx = kx * w
+            let dy = ky * w
+
+            let band = bandMask(depth: snap.depth,
+                                lower: a,
+                                upper: b,
+                                feather: snap.feather,
+                                dilateRadius: snap.dilateRadius)
+
+            let shifted = snap.src
+                .transformed(by: .init(translationX: dx, y: dy))
+                .cropped(to: outExtent)
+
+            let layer = shifted.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: transparent,
+                kCIInputMaskImageKey:       band
+            ])
+
+            acc = layer.applyingFilter("CISourceOverCompositing", parameters: [
+                kCIInputBackgroundImageKey: acc
+            ])
+        }
+
+        return acc
     }
 
     // MARK: - Full-resolution rendering (export)
@@ -197,22 +257,97 @@ final class ParallaxEngine {
                    * travelFractionAtFullIntensity
                    * max(0, intensity)
 
-        let bgTx = yaw   * travel
-        let bgTy = pitch * travel
+        let kx = yaw   * travel
+        let ky = pitch * travel
 
-        let fgTx = -yaw   * travel * fgParallaxFactor
-        let fgTy = -pitch * travel * fgParallaxFactor
+        let outExtent = originalCI.extent
+        let transparent = CIImage(color: .clear).cropped(to: outExtent)
 
-        let bg = bgCI
-            .transformed(by: .init(translationX: bgTx, y: bgTy))
-            .cropped(to: originalCI.extent)
+        @inline(__always)
+        func bandMask(depth: CIImage,
+                      lower: CGFloat,
+                      upper: CGFloat,
+                      feather: CGFloat,
+                      dilateRadius: CGFloat) -> CIImage
+        {
+            let eps = max(0.0001, feather)
 
-        let fg = fgCI
-            .transformed(by: .init(translationX: fgTx, y: fgTy))
-            .cropped(to: originalCI.extent)
+            let up = depth.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector":    CIVector(x: 1/eps, y: 0, z: 0, w: 0),
+                "inputGVector":    CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputBVector":    CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputAVector":    CIVector(x: 0, y: 0, z: 0, w: 1),
+                "inputBiasVector": CIVector(x: -lower/eps, y: -lower/eps, z: -lower/eps, w: 0)
+            ]).applyingFilter("CIColorClamp", parameters: [
+                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+            ])
 
-        return fg.applyingFilter("CISourceOverCompositing",
-                                 parameters: [kCIInputBackgroundImageKey: bg])
+            let down = depth.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector":    CIVector(x: -1/eps, y: 0, z: 0, w: 0),
+                "inputGVector":    CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputBVector":    CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputAVector":    CIVector(x: 0, y: 0, z: 0, w: 1),
+                "inputBiasVector": CIVector(x:  upper/eps, y:  upper/eps, z:  upper/eps, w: 0)
+            ]).applyingFilter("CIColorClamp", parameters: [
+                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+            ])
+
+            let band = up.applyingFilter("CIMinimumCompositing", parameters: [
+                kCIInputBackgroundImageKey: down
+            ])
+
+            let blurred = band
+                .clampedToExtent()
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: max(0.5, eps * 10)])
+                .cropped(to: depth.extent)
+
+            let dilated = blurred.applyingFilter("CIMorphologyMaximum", parameters: [
+                kCIInputRadiusKey: max(0, dilateRadius)
+            ])
+
+            return dilated.applyingFilter("CIColorClamp", parameters: [
+                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+            ])
+        }
+
+        var acc = CIImage(color: .clear).cropped(to: outExtent)
+
+        for i in 0..<bandCount {
+            let a = CGFloat(i) / CGFloat(bandCount)
+            let b = CGFloat(i + 1) / CGFloat(bandCount)
+            let mid = (a + b) * 0.5
+
+            let signed = (0.5 - mid) * 2.0
+            let sgn: CGFloat = (signed == 0) ? 0 : (signed > 0 ? 1 : -1)
+            let w = sgn * pow(abs(signed), max(nearExponent, 1.0))
+
+            let dx = kx * w
+            let dy = ky * w
+
+            let band = bandMask(depth: depthCI,
+                                lower: a,
+                                upper: b,
+                                feather: bandFeather,
+                                dilateRadius: maskDilateRadius)
+
+            let shifted = overscannedSrcCI
+                .transformed(by: .init(translationX: dx, y: dy))
+                .cropped(to: outExtent)
+
+            let layer = shifted.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: transparent,
+                kCIInputMaskImageKey:       band
+            ])
+
+            acc = layer.applyingFilter("CISourceOverCompositing", parameters: [
+                kCIInputBackgroundImageKey: acc
+            ])
+        }
+
+        return acc.cropped(to: outExtent)
     }
 
     // MARK: - Helpers
@@ -221,64 +356,22 @@ final class ParallaxEngine {
     private func rebuildPreviewLayers(targetLongestPx: CGFloat) {
         let longEdge = max(outputSize.width, outputSize.height)
         let newScale = min(1, targetLongestPx / longEdge)
-        if abs(newScale - previewScale) < 0.04, pBgCI != nil, pFgCI != nil {
+        if abs(newScale - previewScale) < 0.04, pSrc != nil, pDepth != nil {
             return
         }
 
         previewScale = newScale
 
-        // Use the same overscan logic in preview as in full-res.
-        let overscanScale: CGFloat = 1.0 + 2.0 * (travelFractionAtFullIntensity + bgOverscanSafety)
-
         if previewScale < 1 {
-            let pOriginal = lanczosScale(originalCI, scale: previewScale)
-            let pMask     = lanczosScale(maskCI, scale: previewScale)
-            let pTransparent = CIImage(color: .clear).cropped(to: pOriginal.extent)
-
-            pFgCI = pOriginal.applyingFilter("CIBlendWithMask", parameters: [
-                kCIInputBackgroundImageKey: pTransparent,
-                kCIInputMaskImageKey:       pMask
-            ])
-
-            let pInvMask = pMask.applyingFilter("CIColorInvert")
-
-            let dx = -(pOriginal.extent.width  * (overscanScale - 1) * 0.5)
-            let dy = -(pOriginal.extent.height * (overscanScale - 1) * 0.5)
-
-            let pExpanded = pOriginal
-                .transformed(by: .init(scaleX: overscanScale, y: overscanScale))
-                .transformed(by: .init(translationX: dx, y: dy))
-                .cropped(to: pOriginal.extent)
-
-            pBgCI = pExpanded.applyingFilter("CIBlendWithMask", parameters: [
-                kCIInputBackgroundImageKey: pTransparent,
-                kCIInputMaskImageKey:       pInvMask
-            ])
-
-            previewSize = pOriginal.extent.size
+            pSrc   = lanczosScale(overscannedSrcCI, scale: previewScale)
+            pDepth = lanczosScale(depthCI,        scale: previewScale)
+            previewSize = CGSize(width: originalCI.extent.width  * previewScale,
+                                 height: originalCI.extent.height * previewScale)
         } else {
-            // No downscale preview
+            pSrc = overscannedSrcCI
+            pDepth = depthCI
             previewSize = outputSize
-            pBgCI = bgCI
-            pFgCI = fgCI
         }
-    }
-
-    private func depthThreshold(_ depth: CIImage, threshold: CGFloat) -> CIImage {
-        // Convert grayscale to alpha via thresholding
-        let params: [String: Any] = [
-            "inputMinComponents": CIVector(x: threshold, y: threshold, z: threshold, w: threshold),
-            "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
-        ]
-        let clamped = depth.applyingFilter("CIColorClamp", parameters: params)
-        // Normalise to 0…1 again
-        return clamped.applyingFilter("CIColorMatrix", parameters: [
-            "inputRVector":    CIVector(x: 2, y: 0, z: 0, w: 0),
-            "inputGVector":    CIVector(x: 0, y: 2, z: 0, w: 0),
-            "inputBVector":    CIVector(x: 0, y: 0, z: 2, w: 0),
-            "inputAVector":    CIVector(x: 0, y: 0, z: 0, w: 1),
-            "inputBiasVector": CIVector(x: -2 * threshold, y: -2 * threshold, z: -2 * threshold, w: 0)
-        ])
     }
 
     private func clamp01(_ image: CIImage) -> CIImage {
@@ -295,6 +388,8 @@ final class ParallaxEngine {
         ])
     }
 }
+
+// MARK: - UIImage bridge
 
 private extension UIImage {
     convenience init(from ci: CIImage, context: CIContext) {
