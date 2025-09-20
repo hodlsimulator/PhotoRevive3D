@@ -4,44 +4,103 @@
 //
 //  Created by . . on 19/09/2025.
 //
+//  Updated: 20/09/2025 — dev runs (Xcode/debug/ad-hoc with embedded.mobileprovision)
+//  do NOT report "Last run crashed: YES" unless a MetricKit payload exists.
+//  Production/TestFlight keeps the old behaviour (unclean exit => YES).
+//
 
 import Foundation
 import os
 import UIKit
-import Darwin // mach task_info(), gmtime_r()
+import Darwin // task_info, sysctl, gmtime_r
 
 enum Diagnostics {
 
     enum Level: String { case debug = "DEBUG", info = "INFO", warn = "WARN", error = "ERROR" }
 
-    // Whether the *previous* run ended uncleanly (set at bootstrap, before we create a new marker)
+    // Frozen for this run after bootstrap()
     private static var previousRunCrashed: Bool = false
+
+    // Persisted facts about the previous run
+    private static let kLastExitCleanKey = "diag.lastExitClean"
+    private static let kPrevBuildKey     = "diag.prevBuild"
+    private static let kPrevVersionKey   = "diag.prevVersion"
+
+    // JSON payload stored in RUNNING.marker so it survives SIGKILLs
+    private struct Marker: Codable {
+        let debug: Bool       // debugger was attached at some point this run
+        let version: String   // app version at time of write
+        let build: String     // build number at time of write
+        let time: TimeInterval
+    }
 
     // MARK: - Bootstrap / lifecycle
 
     static func bootstrap() {
-        // Capture state *before* we create a new marker for this run.
-        previousRunCrashed = FileManager.default.fileExists(atPath: markerURL().path)
-        markLaunch()
+        let fm = FileManager.default
+        let url = markerURL()
+        let markerExists = fm.fileExists(atPath: url.path)
+        let marker = readMarker() // may be nil if pre-JSON marker
+
+        let ud = UserDefaults.standard
+        let prevExitClean = ud.bool(forKey: kLastExitCleanKey)
+
+        // Version/build change should not count as a crash (updates can kill the old run)
+        let curVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let curBuild   = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        let prevVersion = ud.string(forKey: kPrevVersionKey)
+        let prevBuild   = ud.string(forKey: kPrevBuildKey)
+        let isUpgrade   = ((prevVersion != nil && prevVersion != curVersion) || (prevBuild != nil && prevBuild != curBuild))
+
+        // Heuristics
+        let uncleanExit = markerExists && !prevExitClean && !isUpgrade
+        let devBuild    = isDevelopmentLikeBuild() // Xcode / ad-hoc / simulator
+        let hasCrash    = (lastCrashJSON() != nil) // any saved crash/hang JSON from MetricKit
+
+        // Final rule:
+        //  • If we have a crash payload → YES (dev or prod).
+        //  • Else if dev build → NO (don’t treat Xcode Stop as a crash).
+        //  • Else (prod/TestFlight) → YES only if uncleanExit is true.
+        previousRunCrashed = hasCrash || (!devBuild && uncleanExit)
+
+        log(.info,
+            "crashflag: marker=\(markerExists) clean=\(prevExitClean) devBuild=\(devBuild) upgrade=\(isUpgrade) hasCrashJSON=\(hasCrash) → \(previousRunCrashed ? "YES" : "NO")",
+            category: "crashflag"
+        )
+
+        // Prep state for THIS run
+        ud.set(false, forKey: kLastExitCleanKey)
+        ud.set(curVersion, forKey: kPrevVersionKey)
+        ud.set(curBuild, forKey: kPrevBuildKey)
+
+        // Keep marker fresh with current debugger state (file write survives SIGKILL)
+        writeMarker(debug: isDebuggerAttached() || (marker?.debug ?? false), version: curVersion, build: curBuild)
+
         MetricsSubscriber.shared.start()
         log(.info, "Diagnostics bootstrap complete (sampler=OFF)")
     }
 
+    /// Refresh the “app is running” marker (keep debug=true once observed)
     static func markLaunch() {
-        let url = markerURL()
-        try? "running".data(using: .utf8)?.write(to: url, options: .atomic)
+        let curVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let curBuild   = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        let existing   = readMarker()
+        let nowDebug   = isDebuggerAttached() || (existing?.debug ?? false) // sticky true
+        writeMarker(debug: nowDebug, version: curVersion, build: curBuild)
     }
 
+    /// Persist a clean exit and remove the marker.
     static func markCleanExit() {
+        let ud = UserDefaults.standard
+        ud.set(true, forKey: kLastExitCleanKey)
         try? FileManager.default.removeItem(at: markerURL())
     }
 
-    /// True iff the *previous* run did not cleanly exit.
+    /// True iff the *previous* run is classified as a crash per the rule above.
     static var didCrashLastLaunch: Bool { previousRunCrashed }
 
     // MARK: - Logging (OSLog + simple rolling file; no actors, no ICU)
 
-    /// Safe to call from any thread.
     nonisolated static func log(
         _ level: Level = .info,
         _ message: String,
@@ -58,7 +117,7 @@ enum Diagnostics {
         case .error: logger.error("\(category): \(message, privacy: .public)")
         }
 
-        let ts = timestamp() // ICU-free
+        let ts = timestamp()
         let lineStr = "[\(ts)] [\(level.rawValue)] [\(category)] \(message) (\(file):\(line) \(function))"
         appendLine(lineStr)
     }
@@ -79,7 +138,6 @@ enum Diagnostics {
     static func startMemorySampler(tag: String = "") { /* disabled */ }
     static func stopMemorySampler() { /* disabled */ }
 
-    /// Log one snapshot of memory footprint (safe from any thread).
     nonisolated static func logMemory(_ label: String = "") {
         let mb = footprintMB()
         if mb >= 0 {
@@ -90,7 +148,6 @@ enum Diagnostics {
         }
     }
 
-    /// Returns current process physical footprint in MB (or -1 on failure).
     nonisolated private static func footprintMB() -> Double {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<integer_t>.stride)
@@ -123,8 +180,11 @@ enum Diagnostics {
             }
         }
 
-        // Also reset the in-memory flag so the UI flips immediately.
         previousRunCrashed = false
+        let ud = UserDefaults.standard
+        ud.set(false, forKey: kLastExitCleanKey)
+        ud.removeObject(forKey: kPrevBuildKey)
+        ud.removeObject(forKey: kPrevVersionKey)
     }
 
     static func makeTextReport() async throws -> URL {
@@ -187,9 +247,7 @@ enum Diagnostics {
 
         var lines: [String] = []
 
-        if let ts = root["timeStampEnd"] as? String {
-            lines.append("time=\(ts)")
-        }
+        if let ts = root["timeStampEnd"] as? String { lines.append("time=\(ts)") }
 
         if let meta = diag["diagnosticMetaData"] as? [String: Any] {
             let sig = intFrom(meta["signal"])
@@ -210,9 +268,7 @@ enum Diagnostics {
             if !env.isEmpty { lines.append(env.joined(separator: " ")) }
         }
 
-        if let term = diag["terminationReason"] {
-            lines.append("terminationReason=\(term)")
-        }
+        if let term = diag["terminationReason"] { lines.append("terminationReason=\(term)") }
 
         if
             let tree = diag["callStackTree"] as? [String: Any],
@@ -281,6 +337,22 @@ enum Diagnostics {
         diagnosticsDir().appendingPathComponent("RUNNING.marker")
     }
 
+    private static func readMarker() -> Marker? {
+        let url = markerURL()
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(Marker.self, from: data)
+    }
+
+    private static func writeMarker(debug: Bool, version: String, build: String) {
+        let payload = Marker(debug: debug, version: version, build: build, time: Date().timeIntervalSince1970)
+        let url = markerURL()
+        if let data = try? JSONEncoder().encode(payload) {
+            try? data.write(to: url, options: .atomic)
+        } else {
+            try? "running".data(using: .utf8)?.write(to: url, options: .atomic)
+        }
+    }
+
     nonisolated static func diagnosticsDir() -> URL {
         let fm = FileManager.default
         let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -316,7 +388,7 @@ enum Diagnostics {
         )
     }
 
-    // MARK: - Private file helpers
+    // MARK: - File helpers
 
     nonisolated private static func appendLine(_ line: String) {
         let fm = FileManager.default
@@ -348,5 +420,29 @@ enum Diagnostics {
             dir.appendingPathComponent("app.log"),
             dir.appendingPathComponent("app.1.log")
         )
+    }
+
+    // MARK: - Build/debug detection (Security-free)
+
+    /// Treat as a development-like build if either:
+    ///  • A debugger is attached now, or
+    ///  • The app bundle contains an embedded.mobileprovision (typical of Xcode/ad-hoc builds).
+    nonisolated private static func isDevelopmentLikeBuild() -> Bool {
+        if isDebuggerAttached() { return true }
+        if let path = Bundle.main.path(forResource: "embedded", ofType: "mobileprovision") {
+            return FileManager.default.fileExists(atPath: path)
+        }
+        return false
+    }
+
+    /// P_TRACED via sysctl (may be false briefly at launch; we also make it sticky in the marker)
+    nonisolated private static func isDebuggerAttached() -> Bool {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        let result = name.withUnsafeMutableBufferPointer { ptr in
+            sysctl(ptr.baseAddress, u_int(ptr.count), &info, &size, nil, 0)
+        }
+        return (result == 0) && ((info.kp_proc.p_flag & P_TRACED) != 0)
     }
 }

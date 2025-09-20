@@ -2,8 +2,11 @@
 //  PhotoRevive3DApp.swift
 //  PhotoRevive3D
 //
+//  Created by . . on 9/20/25.
+//
 
 import SwiftUI
+import UIKit
 
 @main
 struct PhotoRevive3DApp: App {
@@ -16,12 +19,22 @@ struct PhotoRevive3DApp: App {
     var body: some Scene {
         WindowGroup {
             RootView()
+                // View-level subscription; Scenes don’t have .onReceive
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)) { _ in
+                    Diagnostics.markCleanExit()
+                    Diagnostics.log(.info, "App will terminate; marking clean exit")
+                }
         }
         .onChange(of: scenePhase) { _, phase in
-            // Remove the crash marker on a clean background transition.
-            if phase == .background {
+            switch phase {
+            case .active:
+                Diagnostics.markLaunch()
+                Diagnostics.log(.info, "Scene became active; running marker set")
+            case .background:
                 Diagnostics.markCleanExit()
                 Diagnostics.log(.info, "Scene moved to background; marking clean exit")
+            default:
+                break
             }
         }
     }
