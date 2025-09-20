@@ -14,8 +14,8 @@ import UIKit
 
 @MainActor
 struct ContentView: View {
-
     @Environment(\.displayScale) private var displayScale
+
     @State private var pickerItem: PhotosPickerItem?
     @State private var engine: ParallaxEngine?
 
@@ -35,6 +35,7 @@ struct ContentView: View {
     @State private var exporting = false
     @State private var exportProgress: Double = 0.0
     @State private var exportTask: Task<Void, Never>?
+
     @State private var shareSheet: ShareSheet?
 
     // Coalesced preview rendering
@@ -72,7 +73,9 @@ struct ContentView: View {
             }
             .padding(.bottom, 24)
         }
-        .sheet(item: $shareSheet) { sheet in sheet }
+        .sheet(item: $shareSheet) { sheet in
+            sheet
+        }
 
         // Image picker
         .onChange(of: pickerItem) { _, newItem in
@@ -85,7 +88,7 @@ struct ContentView: View {
             if useMotion {
                 Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
                 motion.start()
-                motion.calibrateZero()      // auto-centre on toggle
+                motion.calibrateZero() // auto-centre on toggle
                 schedulePreview()
             } else {
                 Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
@@ -99,7 +102,10 @@ struct ContentView: View {
         .onChange(of: intensity) { _, _ in schedulePreview() }
         .onChange(of: yaw) { _, _ in if !useMotion { schedulePreview() } }
         .onChange(of: pitch) { _, _ in if !useMotion { schedulePreview() } }
-        .onDisappear { if useMotion { motion.stop() } }
+
+        .onDisappear {
+            if useMotion { motion.stop() }
+        }
     }
 
     // MARK: - UI
@@ -171,9 +177,13 @@ struct ContentView: View {
         VStack(spacing: 12) {
             if engine != nil {
                 HStack {
-                    Toggle(isOn: $useMotion) { Label("Gyro", systemImage: "gyroscope") }
-                        .toggleStyle(.switch)
+                    Toggle(isOn: $useMotion) {
+                        Label("Gyro", systemImage: "gyroscope")
+                    }
+                    .toggleStyle(.switch)
+
                     Spacer()
+
                     Button {
                         if useMotion {
                             motion.calibrateZero()
@@ -191,7 +201,10 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Parallax Intensity").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
                     Slider(
-                        value: Binding(get: { Double(intensity) }, set: { intensity = CGFloat($0) }),
+                        value: Binding(
+                            get: { Double(intensity) },
+                            set: { intensity = CGFloat($0) }
+                        ),
                         in: 0.2...1.0
                     )
                 }
@@ -254,7 +267,9 @@ struct ContentView: View {
                 }
 
                 HStack(spacing: 12) {
-                    Button { startExport() } label: {
+                    Button {
+                        startExport()
+                    } label: {
                         Label("Export Video", systemImage: "square.and.arrow.up")
                     }
                     .buttonStyle(.borderedProminent)
@@ -262,11 +277,14 @@ struct ContentView: View {
 
                     if exporting {
                         ProgressView(value: exportProgress).frame(width: 120)
-                        Button(role: .destructive) { exportTask?.cancel() } label: {
+                        Button(role: .destructive) {
+                            exportTask?.cancel()
+                        } label: {
                             Label("Cancel", systemImage: "xmark.circle")
                         }
                         .buttonStyle(.bordered)
                     }
+
                     Spacer()
                 }
             }
@@ -288,7 +306,8 @@ struct ContentView: View {
         parallaxNotice = nil
         do {
             if let data = try await item.loadTransferable(type: Data.self),
-               let uiImage = UIImage(data: data) {
+               let uiImage = UIImage(data: data)
+            {
                 let engine = ParallaxEngine(image: uiImage)
                 try await engine.prepare()
                 self.engine = engine
@@ -317,6 +336,7 @@ struct ContentView: View {
         )
 
         Diagnostics.log(.info, "Export started (duration=\(exportSeconds)s, fps=\(exportFPS))", category: "export")
+
         exportTask = Task(priority: .userInitiated) {
             do {
                 let url = try await VideoExporter.exportParallaxVideo(
@@ -326,6 +346,7 @@ struct ContentView: View {
                     // progress handler must be synchronous:
                     Task { @MainActor in exportProgress = progress }
                 }
+
                 exporting = false
                 shareSheet = ShareSheet(items: [url])
                 Diagnostics.log(.info, "Export finished → \(url.lastPathComponent)", category: "export")
@@ -362,21 +383,26 @@ struct ContentView: View {
 
     private func schedulePreview() {
         guard let params = currentParams() else { return }
+
         DispatchQueue.main.async {
             self.pendingParams = params
             guard !self.renderInFlight else { return }
             self.renderInFlight = true
+
             self.previewTask = Task.detached(priority: .userInitiated) {
                 var frames = 0
                 var loggedStart = false
+
                 while true {
                     let fetched = await MainActor.run { () -> (ParallaxEngine.PreviewSnapshot, (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat), CGFloat)? in
                         guard let snap = self.engine?.makePreviewSnapshot(),
-                              let next = self.pendingParams else { return nil }
+                              let next = self.pendingParams
+                        else { return nil }
                         let lodPx = self.engine?.previewTargetLongest ?? 0
                         self.pendingParams = nil
                         return (snap, next, lodPx)
                     }
+
                     guard let (snapshot, next, lodPx) = fetched else { break }
 
                     if !loggedStart {
@@ -391,12 +417,23 @@ struct ContentView: View {
                         pitch: next.pitch,
                         intensity: next.intensity
                     )
+
                     frames += 1
-                    if frames % 60 == 0 { Diagnostics.logMemory("[preview.frames=\(frames)]") }
+                    if frames % 60 == 0 {
+                        Diagnostics.logMemory("[preview.frames=\(frames)]")
+                    }
 
                     await MainActor.run {
                         self.previewCI = out.image
-                        self.parallaxNotice = out.usedParallax ? nil : (out.reason ?? "Parallax off: fallback image")
+
+                        // --- NEW: also log the parallax fallback reason into on-device diagnostics (de-duplicated)
+                        let newNotice = out.usedParallax ? nil : (out.reason ?? "Parallax off: fallback image")
+                        if newNotice != self.parallaxNotice, let msg = newNotice {
+                            Diagnostics.log(.warn, msg, category: "parallax")
+                        }
+                        self.parallaxNotice = newNotice
+                        // ---
+
                     }
                 }
 

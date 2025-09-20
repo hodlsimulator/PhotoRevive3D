@@ -5,20 +5,23 @@
 //  Created by . . on 19/09/2025.
 //
 
-// Diagnostics.swift
-// PhotoRevive3D
-
 import Foundation
 import os
 import UIKit
 import Darwin // mach task_info(), gmtime_r()
 
 enum Diagnostics {
+
     enum Level: String { case debug = "DEBUG", info = "INFO", warn = "WARN", error = "ERROR" }
+
+    // Whether the *previous* run ended uncleanly (set at bootstrap, before we create a new marker)
+    private static var previousRunCrashed: Bool = false
 
     // MARK: - Bootstrap / lifecycle
 
     static func bootstrap() {
+        // Capture state *before* we create a new marker for this run.
+        previousRunCrashed = FileManager.default.fileExists(atPath: markerURL().path)
         markLaunch()
         MetricsSubscriber.shared.start()
         log(.info, "Diagnostics bootstrap complete (sampler=OFF)")
@@ -26,16 +29,15 @@ enum Diagnostics {
 
     static func markLaunch() {
         let url = markerURL()
-        try? "running".data(using: String.Encoding.utf8)?.write(to: url, options: .atomic)
+        try? "running".data(using: .utf8)?.write(to: url, options: .atomic)
     }
 
     static func markCleanExit() {
         try? FileManager.default.removeItem(at: markerURL())
     }
 
-    static var didCrashLastLaunch: Bool {
-        FileManager.default.fileExists(atPath: markerURL().path)
-    }
+    /// True iff the *previous* run did not cleanly exit.
+    static var didCrashLastLaunch: Bool { previousRunCrashed }
 
     // MARK: - Logging (OSLog + simple rolling file; no actors, no ICU)
 
@@ -72,9 +74,8 @@ enum Diagnostics {
         return String(decoding: data, as: UTF8.self)
     }
 
-    // MARK: - Memory sampler (REMOVED)
+    // MARK: - Memory sampler (disabled)
 
-    // Fully disabled (Release *and* Debug).
     static func startMemorySampler(tag: String = "") { /* disabled */ }
     static func stopMemorySampler() { /* disabled */ }
 
@@ -92,9 +93,7 @@ enum Diagnostics {
     /// Returns current process physical footprint in MB (or -1 on failure).
     nonisolated private static func footprintMB() -> Double {
         var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(
-            MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<integer_t>.stride
-        )
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<integer_t>.stride)
         let kerr: kern_return_t = withUnsafeMutablePointer(to: &info) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
                 task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
@@ -123,6 +122,9 @@ enum Diagnostics {
                 }
             }
         }
+
+        // Also reset the in-memory flag so the UI flips immediately.
+        previousRunCrashed = false
     }
 
     static func makeTextReport() async throws -> URL {
@@ -138,9 +140,10 @@ enum Diagnostics {
         """
         var body = header
         body += await tail(64 * 1024)
+
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("Diagnostics-\(Int(Date().timeIntervalSince1970)).txt")
-        try body.write(to: url, atomically: true, encoding: String.Encoding.utf8)
+        try body.write(to: url, atomically: true, encoding: .utf8)
         return url
     }
 
@@ -164,30 +167,29 @@ enum Diagnostics {
             let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return da < db
-        }) else {
-            return nil
-        }
-        return try? String(contentsOf: latest, encoding: String.Encoding.utf8)
+        }) else { return nil }
+        return try? String(contentsOf: latest, encoding: .utf8)
     }
 
     static func lastCrashSummary() -> String? {
-        guard let text = lastCrashJSON(),
-              let data = text.data(using: String.Encoding.utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
+        guard
+            let text = lastCrashJSON(),
+            let data = text.data(using: .utf8),
+            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
 
         let buckets = ["crashDiagnostics", "cpuExceptionDiagnostics", "hangDiagnostics"]
         var diag: [String: Any]? = nil
         for key in buckets {
-            if let arr = root[key] as? [[String: Any]], let first = arr.first {
-                diag = first; break
-            }
+            if let arr = root[key] as? [[String: Any]], let first = arr.first { diag = first; break }
         }
         guard let diag else { return "No crash diagnostics array found." }
 
         var lines: [String] = []
-        if let ts = root["timeStampEnd"] as? String { lines.append("time=\(ts)") }
+
+        if let ts = root["timeStampEnd"] as? String {
+            lines.append("time=\(ts)")
+        }
 
         if let meta = diag["diagnosticMetaData"] as? [String: Any] {
             let sig = intFrom(meta["signal"])
@@ -208,13 +210,19 @@ enum Diagnostics {
             if !env.isEmpty { lines.append(env.joined(separator: " ")) }
         }
 
-        if let term = diag["terminationReason"] { lines.append("terminationReason=\(term)") }
+        if let term = diag["terminationReason"] {
+            lines.append("terminationReason=\(term)")
+        }
 
-        if let tree = diag["callStackTree"] as? [String: Any],
-           let stacks = tree["callStacks"] as? [[String: Any]] {
+        if
+            let tree = diag["callStackTree"] as? [String: Any],
+            let stacks = tree["callStacks"] as? [[String: Any]]
+        {
             let chosen = stacks.first(where: { ($0["threadAttributed"] as? Bool) == true }) ?? stacks.first
-            if let frames = chosen?["callStackRootFrames"] as? [[String: Any]],
-               let (name, off) = firstUsefulFrame(from: frames, preferBinary: "PhotoRevive3D") {
+            if
+                let frames = chosen?["callStackRootFrames"] as? [[String: Any]],
+                let (name, off) = firstUsefulFrame(from: frames, preferBinary: "PhotoRevive3D")
+            {
                 let hex = String(off, radix: 16, uppercase: true)
                 lines.append("top=\(name) +0x\(hex)")
             }
@@ -250,40 +258,21 @@ enum Diagnostics {
 
     private static func signalName(_ s: Int) -> String {
         switch s {
-        case 1: return "SIGHUP"
-        case 2: return "SIGINT"
-        case 3: return "SIGQUIT"
-        case 4: return "SIGILL"
-        case 5: return "SIGTRAP"
-        case 6: return "SIGABRT"
-        case 7: return "SIGEMT"
-        case 8: return "SIGFPE"
-        case 9: return "SIGKILL"
-        case 10: return "SIGBUS"
-        case 11: return "SIGSEGV"
-        case 12: return "SIGSYS"
-        case 13: return "SIGPIPE"
-        case 14: return "SIGALRM"
-        case 15: return "SIGTERM"
+        case 1: return "SIGHUP"; case 2: return "SIGINT"; case 3: return "SIGQUIT"
+        case 4: return "SIGILL"; case 5: return "SIGTRAP"; case 6: return "SIGABRT"
+        case 7: return "SIGEMT"; case 8: return "SIGFPE"; case 9: return "SIGKILL"
+        case 10: return "SIGBUS"; case 11: return "SIGSEGV"; case 12: return "SIGSYS"
+        case 13: return "SIGPIPE"; case 14: return "SIGALRM"; case 15: return "SIGTERM"
         default: return "SIG\(s)"
         }
     }
 
     private static func machExceptionName(_ e: Int) -> String {
         switch e {
-        case 1: return "EXC_BAD_ACCESS"
-        case 2: return "EXC_BAD_INSTRUCTION"
-        case 3: return "EXC_ARITHMETIC"
-        case 4: return "EXC_EMULATION"
-        case 5: return "EXC_SOFTWARE"
-        case 6: return "EXC_BREAKPOINT"
-        case 7: return "EXC_SYSCALL"
-        case 8: return "EXC_MACH_SYSCALL"
-        case 9: return "EXC_RPC_ALERT"
-        case 10: return "EXC_CRASH"
-        case 11: return "EXC_RESOURCE"
-        case 12: return "EXC_GUARD"
-        case 13: return "EXC_CORPSE_NOTIFY"
+        case 1: return "EXC_BAD_ACCESS"; case 2: return "EXC_BAD_INSTRUCTION"; case 3: return "EXC_ARITHMETIC"
+        case 4: return "EXC_EMULATION"; case 5: return "EXC_SOFTWARE"; case 6: return "EXC_BREAKPOINT"
+        case 7: return "EXC_SYSCALL"; case 8: return "EXC_MACH_SYSCALL"; case 9: return "EXC_RPC_ALERT"
+        case 10: return "EXC_CRASH"; case 11: return "EXC_RESOURCE"; case 12: return "EXC_GUARD"; case 13: return "EXC_CORPSE_NOTIFY"
         default: return "EXC_\(e)"
         }
     }
@@ -323,8 +312,7 @@ enum Diagnostics {
         let ms = Int((now - floor(now)) * 1000.0)
         return String(
             format: "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-            g.tm_year + 1900, g.tm_mon + 1, g.tm_mday,
-            g.tm_hour, g.tm_min, g.tm_sec, ms
+            g.tm_year + 1900, g.tm_mon + 1, g.tm_mday, g.tm_hour, g.tm_min, g.tm_sec, ms
         )
     }
 
@@ -343,9 +331,11 @@ enum Diagnostics {
             try handle.seekToEnd()
             try handle.write(contentsOf: data)
         } catch { /* ignore */ }
+
         if let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
            let size = (attrs[.size] as? NSNumber)?.intValue,
-           size > 512 * 1024 {
+           size > 512 * 1024
+        {
             try? fm.removeItem(at: backupURL)
             try? fm.moveItem(at: fileURL, to: backupURL)
             fm.createFile(atPath: fileURL.path, contents: nil)
