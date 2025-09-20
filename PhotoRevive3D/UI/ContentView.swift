@@ -12,6 +12,7 @@ import CoreMotion
 import CoreImage
 import UIKit
 
+@MainActor
 struct ContentView: View {
 
     @Environment(\.displayScale) private var displayScale
@@ -42,7 +43,7 @@ struct ContentView: View {
     @State private var pendingParams: (yaw: CGFloat, pitch: CGFloat, intensity: CGFloat)?
     @State private var previewTask: Task<Void, Never>?
 
-    // Parallax status notice for the user
+    // Parallax status notice for the user (set when we fall back)
     @State private var parallaxNotice: String?
 
     @StateObject private var motion = MotionTiltProvider()
@@ -56,9 +57,9 @@ struct ContentView: View {
                     if let eng = engine {
                         previewCard
                             .aspectRatio(eng.outputAspect, contentMode: .fit)
-                            .glassCard()
+                            .modifier(GlassCard())
                     } else {
-                        placeholderCard  // now tappable to open Photos
+                        placeholderCard
                     }
                 }
                 .padding(.horizontal)
@@ -81,16 +82,14 @@ struct ContentView: View {
         // Gyro ON/OFF side-effects run after view updates (no re-entrancy)
         .task(id: useMotion) {
             await Task.yield()
-            await MainActor.run {
-                if useMotion {
-                    Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
-                    motion.start()
-                    motion.calibrateZero()      // <-- auto-centre on toggle
-                    schedulePreview()
-                } else {
-                    Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
-                    motion.stop()
-                }
+            if useMotion {
+                Diagnostics.log(.info, "Gyro toggle: ON", category: "gyro")
+                motion.start()
+                motion.calibrateZero()      // auto-centre on toggle
+                schedulePreview()
+            } else {
+                Diagnostics.log(.info, "Gyro toggle: OFF", category: "gyro")
+                motion.stop()
             }
         }
 
@@ -128,7 +127,7 @@ struct ContentView: View {
                 Text("Pick a photo to begin").foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, minHeight: 260)
-            .glassCard()
+            .modifier(GlassCard())
         }
         .buttonStyle(.plain)
         .padding(.horizontal)
@@ -144,7 +143,6 @@ struct ContentView: View {
             }
 
             if let msg = parallaxNotice {
-                // Subtle banner to indicate fallback and why
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                     Text(msg)
@@ -178,7 +176,7 @@ struct ContentView: View {
                     Spacer()
                     Button {
                         if useMotion {
-                            motion.calibrateZero()      // <-- centre when gyro is ON
+                            motion.calibrateZero()
                         } else {
                             yaw = 0; pitch = 0
                         }
@@ -286,24 +284,23 @@ struct ContentView: View {
 
     private func loadImage(item: PhotosPickerItem?) async {
         guard let item else { return }
-        await MainActor.run { preparing = true; parallaxNotice = nil }
+        preparing = true
+        parallaxNotice = nil
         do {
             if let data = try await item.loadTransferable(type: Data.self),
                let uiImage = UIImage(data: data) {
                 let engine = ParallaxEngine(image: uiImage)
                 try await engine.prepare()
-                await MainActor.run {
-                    self.engine = engine
-                    self.yaw = 0
-                    self.pitch = 0
-                }
+                self.engine = engine
+                self.yaw = 0
+                self.pitch = 0
                 Diagnostics.log(.info, "Image loaded; engine prepared (size=\(engine.outputSize.width)x\(engine.outputSize.height))", category: "engine")
                 schedulePreview()
             }
         } catch {
             Diagnostics.log(.error, "Image load/prepare error: \(error)", category: "engine")
         }
-        await MainActor.run { preparing = false }
+        preparing = false
     }
 
     private func startExport() {
@@ -326,18 +323,17 @@ struct ContentView: View {
                     engine: engine,
                     options: options
                 ) { progress in
+                    // progress handler must be synchronous:
                     Task { @MainActor in exportProgress = progress }
                 }
-                await MainActor.run {
-                    exporting = false
-                    shareSheet = ShareSheet(items: [url])
-                }
+                exporting = false
+                shareSheet = ShareSheet(items: [url])
                 Diagnostics.log(.info, "Export finished → \(url.lastPathComponent)", category: "export")
             } catch is CancellationError {
-                await MainActor.run { exporting = false }
+                exporting = false
                 Diagnostics.log(.warn, "Export cancelled", category: "export")
             } catch {
-                await MainActor.run { exporting = false }
+                exporting = false
                 Diagnostics.log(.error, "Export failed: \(error)", category: "export")
             }
         }
@@ -389,13 +385,18 @@ struct ContentView: View {
                         Diagnostics.logMemory("[preview.start]")
                     }
 
-                    let out = ParallaxEngine.composePreview(from: snapshot, yaw: next.yaw, pitch: next.pitch, intensity: next.intensity)
+                    let out = ParallaxEngine.composePreview(
+                        from: snapshot,
+                        yaw: next.yaw,
+                        pitch: next.pitch,
+                        intensity: next.intensity
+                    )
                     frames += 1
                     if frames % 60 == 0 { Diagnostics.logMemory("[preview.frames=\(frames)]") }
 
                     await MainActor.run {
                         self.previewCI = out.image
-                        self.parallaxNotice = out.usedParallax ? nil : out.reason ?? "Parallax off: fallback image"
+                        self.parallaxNotice = out.usedParallax ? nil : (out.reason ?? "Parallax off: fallback image")
                     }
                 }
 
